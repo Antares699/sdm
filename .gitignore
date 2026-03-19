@@ -1,0 +1,12 @@
+.venv
+__pycache__/
+*.pyc
+.sync.json
+dist/
+build/
+*.egg-info/
+sdm.egg-info/
+*.m3u
+*.lrc
+.pytest_cache/
+.DS_Store

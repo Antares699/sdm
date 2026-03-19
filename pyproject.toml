@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sdm-pycli"
+version = "1.0.0"
+description = "A fast, lightweight, and reliable CLI tool to download and sync Spotify playlists, albums, and tracks."
+readme = "README.md"
+authors = [
+    { name = "Antares699" }
+]
+license = { text = "MIT" }
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Environment :: Console",
+]
+keywords = ["spotify", "download", "sync", "music", "cli"]
+dependencies = [
+    "yt-dlp>=2024.03.10",
+    "mutagen>=1.47.0",
+    "requests>=2.31.0",
+    "rich>=13.7.1",
+    "typer>=0.12.0",
+    "imageio-ffmpeg>=0.4.9"
+]
+requires-python = ">=3.8"
+
+[project.urls]
+"Homepage" = "https://github.com/Antares699/sdm"
+"Bug Tracker" = "https://github.com/Antares699/sdm/issues"
+
+[project.scripts]
+sdm = "sdm.cli:main"
