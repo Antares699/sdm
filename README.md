@@ -1,6 +1,6 @@
 # SDM - SDM Downloads Music
 
-`sdm` is a fast and lightweight CLI tool to download and sync Playlists, Albums, and Tracks from **Spotify, Apple Music, Tidal, YouTube, and SoundCloud**.
+`sdm` is a fast, lightweight, and zero-config CLI tool to download and sync Playlists, Albums, and Tracks from **Spotify, Apple Music, Tidal, YouTube, and SoundCloud**.
 
 ## Why sdm?
 
@@ -49,20 +49,24 @@ Combine flags for the ultimate listening experience:
 ```bash
 sdm download <URL> --lyrics --normalize --sponsor-block -w 5
 ```
-- `--lyrics`: Embed perfectly synced lyrics.
+- `--lyrics`: Embed perfectly synced lyrics for Apple Music / mobile players.
 - `--normalize`: Apply EBU R128 (-14 LUFS) volume normalization.
 - `--sponsor-block`: Trim non-music sections from YouTube sources.
 - `-w 5`: Download with 5 concurrent workers.
 - `--dry-run`: Simulate a sync/download to see what would change.
 
-## Important Notes
+## Music Sourcing & Audio Quality
 
-**Spotify Playlists**
-Spotify playlists must be set to **Public**. Private playlists and personalized mixes (like "Discover Weekly") will not work.
+`sdm` fetches flawless metadata (tags, cover art, tracklists) directly from Spotify, Apple Music, and Tidal, but sources the actual audio streams from YouTube. 
 
-**Age-Restricted Tracks (Cookies)**
-If YouTube blocks explicit tracks, pass your browser cookies. Due to App-Bound Encryption in Chrome/Edge, **Firefox is highly recommended**:
-```bash
-sdm download <URL> --cookies firefox
-```
-*(Alternatively, use an extension to export `cookies.txt` and pass its path).*
+Unlike other tools that require your Premium credentials and risk permanent account bans by ripping directly from encrypted servers, `sdm` acts as a safe, unauthenticated metadata matcher. It reliably delivers DRM-free audio (up to 256kbps AAC or Opus) perfectly packaged to match the original release.
+
+## Legal Disclaimer
+
+*Users are responsible for their actions. We do not support unauthorized downloading of copyrighted material. `sdm` is open-source (MIT License) for educational and personal use only.*
+
+---
+
+**⚠️ Important Technical Notes:**
+- **Spotify Playlists:** Must be set to **Public**. Private playlists and personalized mixes (like "Discover Weekly") will not work.
+- **Explicit Content:** If YouTube blocks downloads, pass browser cookies using `--cookies firefox`. Firefox is recommended as it does not encrypt the cookie database.
