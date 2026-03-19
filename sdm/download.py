@@ -5,6 +5,11 @@ import requests
 import yt_dlp
 import imageio_ffmpeg
 from mutagen.mp4 import MP4, MP4Cover
+from mutagen.mp3 import MP3
+from mutagen.id3 import ID3, TIT2, TPE1, TALB, TPE2, TRCK, TPOS, TCON, TDRC, USLT, APIC
+from mutagen.flac import FLAC, Picture
+from mutagen.oggopus import OggOpus
+import base64
 from pathlib import Path
 import logging
 from sdm.metadata import get_itunes_metadata, get_lrclib_lyrics
@@ -76,59 +81,130 @@ def sanitize_ytdlp_error(error_msg):
 
 
 def embed_metadata(filepath, track, fetch_lyrics=False):
+    ext = filepath.suffix.lower()
+    name = str(track.get("name", "Unknown"))
+    artists = track.get("artists", [])
+    primary_artist = str(artists[0]) if artists else "Unknown"
+    album_name = str(track.get("album", "Unknown"))
+    album_artists = track.get("album_artists", [])
+    album_artist_str = (
+        ", ".join(str(a) for a in album_artists) if album_artists else primary_artist
+    )
+    track_num = int(track.get("track_number") or 1)
+    track_total = int(track.get("tracks_count") or track_num)
+    disc_num = int(track.get("disc_number") or 1)
+
+    genre, release_date = get_itunes_metadata(name, primary_artist)
+    lyrics = ""
+    if fetch_lyrics:
+        lyrics = get_lrclib_lyrics(
+            name, primary_artist, album_name if album_name != "Unknown Album" else None
+        )
+
+    cover_data = None
+    cover_url = track.get("cover_url")
+    if cover_url:
+        try:
+            cover_data = requests.get(cover_url).content
+        except Exception:
+            pass
+
     try:
-        audio = MP4(filepath)
-        name = str(track.get("name", "Unknown"))
-        audio["\xa9nam"] = [name]
-
-        artists = track.get("artists", [])
-        primary_artist = str(artists[0]) if artists else "Unknown"
-        audio["\xa9ART"] = [primary_artist]
-        if len(artists) > 1:
-            audio["aART"] = [", ".join(str(a) for a in artists)]
-
-        album_name = str(track.get("album", "Unknown"))
-        audio["\xa9alb"] = [album_name]
-
-        album_artists = track.get("album_artists", [])
-        if album_artists:
-            audio["aART"] = [", ".join(str(a) for a in album_artists)]
-
-        audio["trkn"] = [
-            (int(track.get("track_number") or 0), int(track.get("tracks_count") or 0))
-        ]
-        audio["disk"] = [(int(track.get("disc_number") or 0), 0)]
-
-        if track.get("source_url"):
-            audio["----:spotdl:WOAS"] = [str(track["source_url"]).encode("utf-8")]
-
-        # iTunes Fallback for Genre and Year
-        genre, release_date = get_itunes_metadata(name, primary_artist)
-        if genre:
-            audio["\xa9gen"] = [str(genre)]
-        if release_date:
-            audio["\xa9day"] = [str(release_date)]
-
-        # LRCLIB Lyrics
-        if fetch_lyrics:
-            lyrics = get_lrclib_lyrics(
-                name,
-                primary_artist,
-                album_name if album_name != "Unknown Album" else None,
-            )
+        if ext == ".m4a":
+            audio = MP4(filepath)
+            audio["\xa9nam"] = [name]
+            audio["\xa9ART"] = [primary_artist]
+            if len(artists) > 1:
+                audio["aART"] = [", ".join(str(a) for a in artists)]
+            audio["\xa9alb"] = [album_name]
+            if album_artists:
+                audio["aART"] = [album_artist_str]
+            audio["trkn"] = [(track_num, track_total)]
+            audio["disk"] = [(disc_num, 0)]
+            if track.get("source_url"):
+                audio["----:spotdl:WOAS"] = [str(track["source_url"]).encode("utf-8")]
+            if genre:
+                audio["\xa9gen"] = [str(genre)]
+            if release_date:
+                audio["\xa9day"] = [str(release_date)]
             if lyrics:
                 audio["\xa9lyr"] = [str(lyrics)]
-
-        cover_url = track.get("cover_url")
-        if cover_url:
-            try:
-                cover_data = requests.get(cover_url).content
+            if cover_data:
                 audio["covr"] = [MP4Cover(cover_data, imageformat=MP4Cover.FORMAT_JPEG)]
-            except Exception:
-                pass
+            audio.save()
+            return True
 
-        audio.save()
-        return True
+        elif ext == ".mp3":
+            try:
+                audio = MP3(filepath, ID3=ID3)
+            except Exception:
+                audio = MP3(filepath)
+            if audio.tags is None:
+                audio.add_tags()
+            audio.tags.add(TIT2(encoding=3, text=name))
+            audio.tags.add(TPE1(encoding=3, text=primary_artist))
+            audio.tags.add(TALB(encoding=3, text=album_name))
+            audio.tags.add(TPE2(encoding=3, text=album_artist_str))
+            audio.tags.add(TRCK(encoding=3, text=f"{track_num}/{track_total}"))
+            audio.tags.add(TPOS(encoding=3, text=f"{disc_num}/1"))
+            if genre:
+                audio.tags.add(TCON(encoding=3, text=genre))
+            if release_date:
+                audio.tags.add(TDRC(encoding=3, text=release_date[:4]))
+            if lyrics:
+                audio.tags.add(USLT(encoding=3, lang="eng", desc="", text=lyrics))
+            if cover_data:
+                audio.tags.add(
+                    APIC(
+                        encoding=3,
+                        mime="image/jpeg",
+                        type=3,
+                        desc="Cover",
+                        data=cover_data,
+                    )
+                )
+            audio.save()
+            return True
+
+        elif ext in [".flac", ".opus"]:
+            if ext == ".flac":
+                audio = FLAC(filepath)
+            else:
+                audio = OggOpus(filepath)
+
+            audio["TITLE"] = name
+            audio["ARTIST"] = primary_artist
+            audio["ALBUM"] = album_name
+            audio["ALBUMARTIST"] = album_artist_str
+            audio["TRACKNUMBER"] = str(track_num)
+            audio["TRACKTOTAL"] = str(track_total)
+            audio["DISCNUMBER"] = str(disc_num)
+            if genre:
+                audio["GENRE"] = genre
+            if release_date:
+                audio["DATE"] = release_date[:4]
+            if lyrics:
+                audio["LYRICS"] = lyrics
+
+            if cover_data:
+                pic = Picture()
+                pic.type = 3
+                pic.mime = "image/jpeg"
+                pic.desc = "Cover"
+                pic.data = cover_data
+
+                if ext == ".flac":
+                    audio.add_picture(pic)
+                else:
+                    audio["metadata_block_picture"] = [
+                        base64.b64encode(pic.write()).decode("ascii")
+                    ]
+            audio.save()
+            return True
+
+        else:
+            return False
+
     except Exception:
         return False
 
@@ -223,7 +299,6 @@ def download_and_tag(
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             try:
                 if direct_url:
-                    
                     info = {"entries": [{"url": direct_url}]}
                 else:
                     info = ydl.extract_info(f"ytsearch3:{search_query}", download=False)

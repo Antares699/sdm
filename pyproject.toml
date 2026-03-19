@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sdm-pycli"
-version = "1.0.0"
-description = "A fast, lightweight, and reliable CLI tool to download and sync Spotify playlists, albums, and tracks."
+version = "1.1.0"
+description = "A fast, lightweight, and reliable CLI tool to download and sync playlists, albums, and tracks."
 readme = "README.md"
 authors = [
     { name = "Antares699" }

@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import subprocess
 import imageio_ffmpeg
 import typer
+from enum import Enum
 
 from rich.console import Console
 from rich.progress import (
@@ -22,7 +23,7 @@ from sdm.sync import SyncManager
 
 app = typer.Typer(
     name="sdm",
-    help="SDM - A fast, lightweight, and reliable CLI tool to download and sync Spotify playlists, albums, and tracks.",
+    help="SDM - A fast, lightweight, and reliable CLI tool to download and sync Spotify, Apple Music, Tidal, and YouTube playlists.",
     add_completion=False,
     rich_markup_mode="rich",
 )
@@ -30,52 +31,40 @@ app = typer.Typer(
 console = Console()
 
 
-@app.command(
-    help="Download and sync a Playlist, Album, or Track from Spotify, YouTube, or SoundCloud."
-)
-def download(
-    url: str = typer.Argument(..., help="Playlist, Album, or Track URL"),
-    output: Path = typer.Option(
-        ".", "--output", "-o", help="Output directory (default: current directory)"
-    ),
-    sync: bool = typer.Option(
-        False,
-        "--sync",
-        help="Delete local files that are no longer in the source list",
-    ),
-    workers: int = typer.Option(
-        3, "--workers", "-w", help="Number of concurrent downloads (default: 3)"
-    ),
-    cookies: str = typer.Option(
-        None,
-        "--cookies",
-        "-c",
-        help="Browser name (e.g., firefox) or path to a cookies.txt file to bypass age restrictions",
-    ),
-    sponsor_block: bool = typer.Option(
-        False,
-        "--sponsor-block",
-        help="Use SponsorBlock to automatically trim non-music sections from YouTube videos",
-    ),
-    normalize: bool = typer.Option(
-        False,
-        "--normalize",
-        help="Apply EBU R128 (-14 LUFS) audio normalization to all tracks",
-    ),
-    lyrics: bool = typer.Option(
-        False,
-        "--lyrics",
-        help="Automatically fetch and embed lyrics from LRCLIB",
-    ),
-    refresh_metadata: bool = typer.Option(
-        False,
-        "--refresh-metadata",
-        "--refresh",
-        help="Force re-tagging of existing local files with the latest metadata and lyrics",
-    ),
+class AudioFormat(str, Enum):
+    m4a = "m4a"
+    mp3 = "mp3"
+    flac = "flac"
+    opus = "opus"
+
+
+def execute_sync_or_download(
+    url: str,
+    output_dir: Path,
+    format: AudioFormat,
+    cleanup: bool,
+    dry_run: bool,
+    no_delete: bool,
+    workers: int,
+    cookies: str,
+    sponsor_block: bool,
+    normalize: bool,
+    lyrics: bool,
+    refresh_metadata: bool,
 ):
-    output_dir = output.resolve()
     sync_manager = SyncManager(output_dir)
+    if url:
+        sync_manager.set_source_url(url)
+    else:
+        url = sync_manager.get_source_url()
+        if not url:
+            console.print(
+                "[bold red]Error:[/] No source URL found in this directory. Please run `sdm download <url>` once to link it."
+            )
+            raise typer.Exit(code=1)
+
+    if dry_run:
+        no_delete = True
 
     console.print("[bold green]sdm: Gathering metadata...[/bold green]")
     try:
@@ -102,7 +91,6 @@ def download(
     drm_blocked_tracks = []
     deleted_files = []
 
-    # Filter out already synced tracks
     for index, track in enumerate(tracks, start=1):
         track_id = track.get("id")
         if not track_id:
@@ -118,7 +106,8 @@ def download(
 
         tracks_to_download.append((index, track, is_synced))
 
-    sync_manager.update_index_map(index_mapping)
+    if not dry_run:
+        sync_manager.update_index_map(index_mapping)
 
     if skipped_count > 0:
         console.print(
@@ -126,13 +115,23 @@ def download(
         )
 
     if tracks_to_download:
-        action_verb = "Refreshing" if refresh_metadata else "Downloading"
+        action_verb = (
+            "Simulating"
+            if dry_run
+            else ("Refreshing" if refresh_metadata else "Downloading")
+        )
         console.print(
             f"{action_verb} {len(tracks_to_download)} tracks using {workers} workers..."
         )
 
         def worker(index, track, is_synced):
             title = track.get("name", "Unknown")
+            if dry_run:
+                if not is_synced:
+                    return "dry_run_success", "Simulated download"
+                else:
+                    return "dry_run_refresh", "Simulated refresh"
+
             if is_synced:
                 filename = sync_manager.data["tracks"].get(track["id"])
                 if not filename:
@@ -150,7 +149,7 @@ def download(
                     output_dir,
                     index,
                     cookies,
-                    "m4a",
+                    format.value,
                     False,
                     sponsor_block,
                     normalize,
@@ -196,6 +195,16 @@ def download(
                                 progress.console.print(
                                     f"[blue][*][/blue] Refreshed: {title}"
                                 )
+                        elif status == "dry_run_success":
+                            downloaded_count += 1
+                            progress.console.print(
+                                f"[green][~][/green] Would download: {title}"
+                            )
+                        elif status == "dry_run_refresh":
+                            refreshed_count += 1
+                            progress.console.print(
+                                f"[blue][~][/blue] Would refresh: {title}"
+                            )
 
                         elif status == "drm_blocked":
                             drm_blocked_tracks.append((track, index))
@@ -226,21 +235,23 @@ def download(
                     except Exception as e:
                         error_count += 1
                         progress.console.print(
-                            f"[red][-][/red] Exception downloading {title}: {e}"
+                            f"[red][-][/red] Exception processing {title}: {e}"
                         )
 
                     progress.advance(main_task)
     else:
         console.print("[green]All tracks are already up to date.[/green]")
 
-    if sync:
+    if cleanup and not no_delete:
         console.print("[yellow]Performing sync cleanup...[/yellow]")
-        deleted_files = sync_manager.cleanup(current_ids)
+        deleted_files = sync_manager.cleanup(
+            current_ids, dry_run=dry_run, no_delete=no_delete
+        )
         for f in deleted_files:
-            console.print(f"[red][-] Deleted:[/] {f}")
+            prefix = "[~] Would delete:" if dry_run else "[-] Deleted:"
+            console.print(f"[red]{prefix}[/] {f}")
 
-    # Print summary table
-    table = Table(title="sdm Summary")
+    table = Table(title=f"sdm Summary {'(DRY RUN)' if dry_run else ''}")
     table.add_column("Metric", style="cyan")
     table.add_column("Count", style="magenta")
 
@@ -256,13 +267,13 @@ def download(
         table.add_row("Encryption Errors", str(encryption_error_count), style="red")
     if error_count > 0:
         table.add_row("Other Errors", str(error_count), style="red")
-    if sync:
+    if cleanup:
         table.add_row("Deleted (Sync)", str(len(deleted_files)))
 
     console.print("\n")
     console.print(table)
 
-    if drm_blocked_tracks:
+    if drm_blocked_tracks and not dry_run:
         console.print(
             f"\n[bold yellow][!] {len(drm_blocked_tracks)} tracks were blocked by YouTube's DRM.[/bold yellow]"
         )
@@ -277,7 +288,7 @@ def download(
             "     [yellow](CAUTION: SoundCloud official tracks are heavily copyright-striked. These may be pitched-down or unofficial bootlegs).[/yellow]"
         )
         console.print(
-            "  [bold]B)[/] Download the pristine MP3s yourself and use the 'sdm inject' command to weave them seamlessly into the playlist."
+            "  [bold]B)[/] Download the pristine audio yourself and use the 'sdm inject' command."
         )
 
         do_fallback = Confirm.ask(
@@ -305,7 +316,7 @@ def download(
                             output_dir,
                             index,
                             cookies,
-                            "m4a",
+                            format.value,
                             True,
                             sponsor_block,
                             normalize,
@@ -333,24 +344,193 @@ def download(
                 f'  sdm inject "your_file.mp3" "<track_url>" -o "{output_dir}"'
             )
 
-    # Generate M3U file
-    m3u_path = output_dir / "_playlist.m3u"
-    try:
-        with open(m3u_path, "w", encoding="utf-8") as f:
-            f.write("#EXTM3U\n")
-            for t in tracks:
-                t_id = t.get("id")
-                fname = sync_manager.data["tracks"].get(t_id)
-                if fname:
-                    f.write(f"{fname}\n")
-    except Exception as e:
-        console.print(f"[yellow]Warning:[/] Failed to generate _playlist.m3u ({e})")
+    if not dry_run:
+        m3u_path = output_dir / "_playlist.m3u"
+        try:
+            with open(m3u_path, "w", encoding="utf-8") as f:
+                f.write("#EXTM3U\n")
+                for t in tracks:
+                    t_id = t.get("id")
+                    fname = sync_manager.data["tracks"].get(t_id)
+                    if fname:
+                        f.write(f"{fname}\n")
+        except Exception as e:
+            console.print(f"[yellow]Warning:[/] Failed to generate _playlist.m3u ({e})")
 
     console.print("\n[bold green]Done![/bold green]")
 
 
 @app.command(
-    help="Inject a local audio file, apply Spotify metadata, and protect it from sync deletion."
+    help="Download a Playlist, Album, or Track from supported streaming services."
+)
+def download(
+    url: str = typer.Argument(..., help="Playlist, Album, or Track URL"),
+    output: Path = typer.Option(
+        ".", "--output", "-o", help="Output directory", rich_help_panel="Output Options"
+    ),
+    format: AudioFormat = typer.Option(
+        AudioFormat.m4a,
+        "--format",
+        "-f",
+        help="Audio codec to use",
+        rich_help_panel="Output Options",
+    ),
+    cleanup: bool = typer.Option(
+        False,
+        "--cleanup",
+        help="Delete local files that are no longer in the remote list (Same as sync)",
+        rich_help_panel="Sync Options",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Simulate the download/sync process [red]without making changes[/red]",
+        rich_help_panel="Sync Options",
+    ),
+    no_delete: bool = typer.Option(
+        False,
+        "--no-delete",
+        help="Do not delete any local files during cleanup",
+        rich_help_panel="Sync Options",
+    ),
+    workers: int = typer.Option(
+        3,
+        "--workers",
+        "-w",
+        help="Number of concurrent downloads",
+        rich_help_panel="Performance",
+    ),
+    cookies: str = typer.Option(
+        None,
+        "--cookies",
+        "-c",
+        help="Browser name (e.g., firefox) or path to cookies.txt",
+        rich_help_panel="Authentication",
+    ),
+    sponsor_block: bool = typer.Option(
+        False,
+        "--sponsor-block",
+        help="Use SponsorBlock to trim non-music sections",
+        rich_help_panel="Audio Processing",
+    ),
+    normalize: bool = typer.Option(
+        False,
+        "--normalize",
+        help="Apply EBU R128 (-14 LUFS) audio normalization",
+        rich_help_panel="Audio Processing",
+    ),
+    lyrics: bool = typer.Option(
+        False,
+        "--lyrics",
+        help="Automatically fetch and embed synced lyrics",
+        rich_help_panel="Metadata & Tags",
+    ),
+    refresh_metadata: bool = typer.Option(
+        False,
+        "--refresh-metadata",
+        "--refresh",
+        help="Force re-tagging of existing local files",
+        rich_help_panel="Metadata & Tags",
+    ),
+):
+    output_dir = output.resolve()
+    execute_sync_or_download(
+        url=url,
+        output_dir=output_dir,
+        format=format,
+        cleanup=cleanup,
+        dry_run=dry_run,
+        no_delete=no_delete,
+        workers=workers,
+        cookies=cookies,
+        sponsor_block=sponsor_block,
+        normalize=normalize,
+        lyrics=lyrics,
+        refresh_metadata=refresh_metadata,
+    )
+
+
+@app.command(help="Sync a previously downloaded directory with its source URL.")
+def sync(
+    dir: Path = typer.Argument(".", help="Directory to sync"),
+    format: AudioFormat = typer.Option(
+        AudioFormat.m4a,
+        "--format",
+        "-f",
+        help="Audio codec to use for new tracks",
+        rich_help_panel="Output Options",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Simulate the sync process [red]without making changes[/red]",
+        rich_help_panel="Sync Options",
+    ),
+    no_delete: bool = typer.Option(
+        False,
+        "--no-delete",
+        help="Do not delete any local files during sync",
+        rich_help_panel="Sync Options",
+    ),
+    workers: int = typer.Option(
+        3,
+        "--workers",
+        "-w",
+        help="Number of concurrent downloads",
+        rich_help_panel="Performance",
+    ),
+    cookies: str = typer.Option(
+        None,
+        "--cookies",
+        "-c",
+        help="Browser name (e.g., firefox) or path to cookies.txt",
+        rich_help_panel="Authentication",
+    ),
+    sponsor_block: bool = typer.Option(
+        False,
+        "--sponsor-block",
+        help="Use SponsorBlock to trim non-music sections",
+        rich_help_panel="Audio Processing",
+    ),
+    normalize: bool = typer.Option(
+        False,
+        "--normalize",
+        help="Apply EBU R128 (-14 LUFS) audio normalization",
+        rich_help_panel="Audio Processing",
+    ),
+    lyrics: bool = typer.Option(
+        False,
+        "--lyrics",
+        help="Automatically fetch and embed synced lyrics",
+        rich_help_panel="Metadata & Tags",
+    ),
+    refresh_metadata: bool = typer.Option(
+        False,
+        "--refresh-metadata",
+        "--refresh",
+        help="Force re-tagging of existing local files",
+        rich_help_panel="Metadata & Tags",
+    ),
+):
+    output_dir = dir.resolve()
+    execute_sync_or_download(
+        url=None,
+        output_dir=output_dir,
+        format=format,
+        cleanup=True,
+        dry_run=dry_run,
+        no_delete=no_delete,
+        workers=workers,
+        cookies=cookies,
+        sponsor_block=sponsor_block,
+        normalize=normalize,
+        lyrics=lyrics,
+        refresh_metadata=refresh_metadata,
+    )
+
+
+@app.command(
+    help="Inject a local audio file, apply metadata, and protect it from sync deletion."
 )
 def inject(
     file: Path = typer.Argument(
@@ -361,24 +541,34 @@ def inject(
         readable=True,
         help="Path to the local audio file to inject",
     ),
-    url: str = typer.Argument(
-        ..., help="Spotify Track URL to extract metadata and tags from"
-    ),
+    url: str = typer.Argument(..., help="Track URL to extract metadata and tags from"),
     output: Path = typer.Option(
-        ".", "--output", "-o", help="Output directory (default: current directory)"
+        ".", "--output", "-o", help="Output directory", rich_help_panel="Output Options"
+    ),
+    format: AudioFormat = typer.Option(
+        AudioFormat.m4a,
+        "--format",
+        "-f",
+        help="Output format for injected file",
+        rich_help_panel="Output Options",
     ),
     index: int = typer.Option(
-        0, "--index", help="Track index to use for naming when injecting (e.g., 103)"
+        0,
+        "--index",
+        help="Track index to use for naming",
+        rich_help_panel="Metadata & Tags",
     ),
     normalize: bool = typer.Option(
         False,
         "--normalize",
-        help="Apply EBU R128 (-14 LUFS) audio normalization to the injected file",
+        help="Apply EBU R128 (-14 LUFS) audio normalization",
+        rich_help_panel="Audio Processing",
     ),
     lyrics: bool = typer.Option(
         False,
         "--lyrics",
-        help="Automatically fetch and embed lyrics from LRCLIB",
+        help="Automatically fetch and embed synced lyrics",
+        rich_help_panel="Metadata & Tags",
     ),
 ):
     output_dir = output.resolve()
@@ -395,7 +585,7 @@ def inject(
 
         if len(tracks) > 1:
             console.print(
-                "[bold red]Error:[/] You provided a Playlist or Album URL. Please provide a specific Spotify TRACK URL when injecting a single file."
+                "[bold red]Error:[/] You provided a Playlist or Album URL. Please provide a specific TRACK URL when injecting a single file."
             )
             raise typer.Exit(code=1)
 
@@ -409,21 +599,24 @@ def inject(
         title = sanitize_filename(track.get("name"))
         artists = track.get("artists", [])
         artist = sanitize_filename(artists[0] if artists else "Unknown")
-        filename_template = f"{index_val:02d} - {artist} - {title}.m4a"
+        filename_template = f"{index_val:02d} - {artist} - {title}.{format.value}"
         final_filepath = output_dir / filename_template
 
         console.print(f"[cyan]Converting and importing {filename_template}...[/cyan]")
 
-        cmd = [
-            imageio_ffmpeg.get_ffmpeg_exe(),
-            "-y",
-            "-i",
-            str(file),
-            "-c:a",
-            "aac",
-            "-b:a",
-            "256k",
+        cmd = [imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-i", str(file)]
+
+        codec = {"m4a": "aac", "mp3": "libmp3lame", "flac": "flac", "opus": "libopus"}[
+            format.value
         ]
+        cmd.extend(["-c:a", codec])
+
+        if format.value == "mp3":
+            cmd.extend(["-q:a", "2"])
+        elif format.value == "m4a":
+            cmd.extend(["-b:a", "256k"])
+        elif format.value == "opus":
+            cmd.extend(["-b:a", "128k"])
 
         if normalize:
             cmd.extend(["-af", "loudnorm=I=-14:LRA=11:TP=-1.5"])
@@ -432,10 +625,7 @@ def inject(
 
         try:
             subprocess.run(
-                cmd,
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
         except FileNotFoundError:
             console.print(
