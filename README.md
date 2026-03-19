@@ -21,39 +21,111 @@ Recently, Spotify restricted their Web API, requiring developers to have a Premi
 ```bash
 pip install sdm-pycli
 ```
-*Note: `sdm` comes with everything bundled, including FFmpeg.*
 
-## Quick Start
+No additional software is required. `sdm` bundles everything it needs, including FFmpeg.
 
-### 1. Download
-Download a playlist, album, or track to your current directory. Use `-f` to specify the format.
+## Usage
+
+Open a terminal in the folder where you want your music saved, then run the commands below.
+
+### Playlist
+
+To download a playlist, run
+
 ```bash
-sdm download "https://music.apple.com/us/album/..." -f flac -o "./My Music"
+sdm download [playlistUrl]
 ```
 
-### 2. Sync
-`sdm` remembers the URL. Later, simply run `sync` to update the folder with the newest changes from the remote playlist:
+Example:
+
 ```bash
-sdm sync "./My Music"
+sdm download https://open.spotify.com/playlist/37i9dQZF1E8NjgPSXnmGkI?si=O0kgUaFcQnatcvlZzS9yJw
 ```
 
-### 3. Inject Local Files
-Have your own pristine audio file? Weave it seamlessly into your playlist with official metadata. It will be protected from future sync deletions:
+### Album
+
+To download an album, run
+
 ```bash
-sdm inject "song.mp3" "https://open.spotify.com/track/..." -o "./My Music"
+sdm download [albumUrl]
 ```
 
-## Advanced Usage
+Example:
 
-Combine flags for the ultimate listening experience:
 ```bash
-sdm download <URL> --lyrics --normalize --sponsor-block -w 5
+sdm download https://open.spotify.com/album/6eUW0wxWtzkFdaEFsTJto6?si=nYD6g_tZQvuFsMzyKG2sRA
 ```
-- `--lyrics`: Embed perfectly synced lyrics for Apple Music / mobile players.
-- `--normalize`: Apply EBU R128 (-14 LUFS) volume normalization.
-- `--sponsor-block`: Trim non-music sections from YouTube sources.
-- `-w 5`: Download with 5 concurrent workers.
-- `--dry-run`: Simulate a sync/download to see what would change.
+
+### Track
+
+To download a single track, run
+
+```bash
+sdm download [trackUrl]
+```
+
+Example:
+
+```bash
+sdm download https://open.spotify.com/track/4PTG3Z6ehGkBFwjybzWkR8?si=1d83934b63464e9e
+```
+
+### Apple Music
+
+Apple Music albums, playlists, and songs are also supported.
+
+```bash
+sdm download https://music.apple.com/us/album/starboy/1440871397
+```
+
+### Sync
+
+`sdm` remembers the source URL for each folder. To update a previously downloaded folder with any changes from the remote playlist, run
+
+```bash
+sdm sync [directory]
+```
+
+Example:
+
+```bash
+sdm sync "C:\Users\You\Music\My Playlist"
+```
+
+### Inject
+
+To import a local audio file into your playlist with official metadata and protect it from future sync deletions, run
+
+```bash
+sdm inject [filePath] [trackUrl]
+```
+
+Example:
+
+```bash
+sdm inject "C:\Users\You\Downloads\song.mp3" https://open.spotify.com/track/0VjIjW4GlUZAMYd2vXMi3b
+```
+
+## Options & Flags
+
+| Flag | Description |
+|---|---|
+| `-o, --output` | Save to a specific directory |
+| `-f, --format` | Audio format: `m4a`, `mp3`, `flac`, `opus` (default: `m4a`) |
+| `-w, --workers` | Number of concurrent downloads (default: `3`) |
+| `--lyrics` | Fetch and embed synced lyrics from LRCLIB |
+| `--normalize` | Apply EBU R128 (-14 LUFS) volume normalization |
+| `--sponsor-block` | Trim non-music sections from YouTube sources |
+| `--dry-run` | Simulate a sync/download without making changes |
+| `--no-delete` | Download new tracks but never delete local files |
+| `--refresh-metadata` | Re-tag existing files with the latest metadata |
+| `--cookies` | Pass browser cookies for age-restricted content |
+
+Example with flags:
+
+```bash
+sdm download https://open.spotify.com/playlist/37i9dQZF1E8UXBoz02kGID -f flac --lyrics --normalize
+```
 
 ## Music Sourcing & Audio Quality
 
@@ -67,6 +139,6 @@ Unlike other tools that require your Premium credentials and risk permanent acco
 
 ---
 
-**⚠️ Important Technical Notes:**
-- **Spotify Playlists:** Must be set to **Public**. Private playlists and personalized mixes (like "Discover Weekly") will not work.
-- **Explicit Content:** If YouTube blocks downloads, pass browser cookies using `--cookies firefox`. Firefox is recommended as it does not encrypt the cookie database.
+**Important Notes:**
+- **Spotify Playlists** must be set to **Public**. Private playlists and personalized mixes will not work.
+- **Explicit Content:** If YouTube blocks downloads, pass browser cookies with `--cookies firefox`. Firefox is recommended.

@@ -1,3 +1,3 @@
-"""SDM - SDM Downloads Music. A fast CLI tool to download and sync Spotify playlists."""
+"""SDM - SDM Downloads Music. A fast CLI tool to download and sync playlists from Spotify, Apple Music, Tidal, YouTube, and SoundCloud."""
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"

@@ -1,56 +1,39 @@
 import re
 import json
 import requests
-import spotapi
 import yt_dlp
 
 
-def _parse_track_dict(t3, t2):
-    name = t3.get("identityTrait", {}).get("name")
-    if not name:
-        name = t3.get("name") or t2.get("name")
-
-    artists = []
-    contributors = t3.get("identityTrait", {}).get("contributors", {}).get("items", [])
-    for a in contributors:
-        artist_name = a.get("profile", {}).get("name") or a.get("name")
-        if artist_name:
-            artists.append(artist_name)
-
-    track_number = t2.get("trackNumber", 0)
-    disc_number = t2.get("discNumber", 0)
-    uri = t2.get("uri", "").replace("spotify:track:", "") or t3.get("uri", "").replace(
-        "spotify:track:", ""
+def _fetch_spotify_embed(embed_url):
+    html = requests.get(embed_url).text
+    match = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html)
+    if not match:
+        raise ValueError("Could not extract Spotify embed data.")
+    data = json.loads(match.group(1))
+    entity = (
+        data.get("props", {})
+        .get("pageProps", {})
+        .get("state", {})
+        .get("data", {})
+        .get("entity")
     )
+    if not entity:
+        raise ValueError("Could not parse Spotify embed entity.")
+    return entity
 
-    cover_url = ""
-    album_data = t2.get("albumOfTrack", {})
-    album_name = album_data.get("name", "")
-    album_artists = []
-    for a in album_data.get("artists", {}).get("items", []):
-        aa_name = a.get("profile", {}).get("name") or a.get("name")
-        if aa_name:
-            album_artists.append(aa_name)
 
-    cover_sources = album_data.get("coverArt", {}).get("sources", [])
-    if cover_sources:
-        cover_sources.sort(key=lambda x: x.get("width", 0), reverse=True)
-        cover_url = cover_sources[0].get("url")
+def _get_embed_cover(entity):
+    images = entity.get("visualIdentity", {}).get("image", [])
+    if images:
+        largest = sorted(images, key=lambda x: x.get("maxHeight", 0), reverse=True)
+        return largest[0].get("url", "")
+    return ""
 
-    if not uri:
-        return None
 
-    return {
-        "id": f"sp:{uri}",
-        "name": name,
-        "artists": artists,
-        "album": album_name,
-        "album_artists": album_artists,
-        "track_number": track_number,
-        "disc_number": disc_number,
-        "cover_url": cover_url,
-        "source_url": f"https://open.spotify.com/track/{uri}",
-    }
+def _parse_subtitle_artists(subtitle):
+    if not subtitle:
+        return ["Unknown Artist"]
+    return [a.strip() for a in subtitle.replace("\xa0", " ").split(",")]
 
 
 def get_playlist_tracks(url):
@@ -59,16 +42,31 @@ def get_playlist_tracks(url):
         raise ValueError("Invalid Spotify playlist URL")
     playlist_id = match.group(1)
 
+    entity = _fetch_spotify_embed(
+        f"https://open.spotify.com/embed/playlist/{playlist_id}"
+    )
+    playlist_name = entity.get("name", "Spotify Playlist")
+    cover_url = _get_embed_cover(entity)
+
     tracks = []
-    for chunk in spotapi.PublicPlaylist(playlist_id).paginate_playlist():
-        items = chunk.get("items", [])
-        for item in items:
-            t3 = item.get("itemV3", {}).get("data", {})
-            t2 = item.get("itemV2", {}).get("data", {})
-            if t3 and t2:
-                track = _parse_track_dict(t3, t2)
-                if track:
-                    tracks.append(track)
+    for i, item in enumerate(entity.get("trackList", []), start=1):
+        uri = item.get("uri", "").replace("spotify:track:", "")
+        if not uri:
+            continue
+        artists = _parse_subtitle_artists(item.get("subtitle"))
+        tracks.append(
+            {
+                "id": f"sp:{uri}",
+                "name": item.get("title", "Unknown Track"),
+                "artists": artists,
+                "album": playlist_name,
+                "album_artists": artists,
+                "track_number": i,
+                "disc_number": 1,
+                "cover_url": cover_url,
+                "source_url": f"https://open.spotify.com/track/{uri}",
+            }
+        )
     return tracks
 
 
@@ -78,53 +76,31 @@ def get_album_tracks(url):
         raise ValueError("Invalid Spotify album URL")
     album_id = match.group(1)
 
-    album = spotapi.PublicAlbum(album_id)
-    album_data = album.get_album_info().get("data", {}).get("albumUnion", {})
-    album_name = album_data.get("name", "")
-    album_artists = [
-        a.get("profile", {}).get("name")
-        for a in album_data.get("artists", {}).get("items", [])
-        if a.get("profile", {}).get("name")
-    ]
-    album_cover_url = ""
-    try:
-        sources = album_data.get("coverArt", {}).get("sources", [])
-        if sources:
-            sources.sort(key=lambda x: x.get("width", 0), reverse=True)
-            album_cover_url = sources[0].get("url")
-    except Exception:
-        pass
+    entity = _fetch_spotify_embed(f"https://open.spotify.com/embed/album/{album_id}")
+    album_name = entity.get("name", "Unknown Album")
+    album_artist = entity.get("subtitle", "Unknown Artist")
+    album_artists = _parse_subtitle_artists(album_artist)
+    cover_url = _get_embed_cover(entity)
 
     tracks = []
-    for chunk in album.paginate_album():
-        for item in chunk:
-            track_data = item.get("track", {})
-            if not track_data:
-                continue
-
-            uri = track_data.get("uri", "").replace("spotify:track:", "")
-            if not uri:
-                continue
-
-            artists = [
-                a.get("profile", {}).get("name")
-                for a in track_data.get("artists", {}).get("items", [])
-                if a.get("profile", {}).get("name")
-            ]
-
-            tracks.append(
-                {
-                    "id": f"sp:{uri}",
-                    "name": track_data.get("name"),
-                    "artists": artists,
-                    "album": album_name,
-                    "album_artists": album_artists,
-                    "track_number": track_data.get("trackNumber", 0),
-                    "disc_number": track_data.get("discNumber", 0),
-                    "cover_url": album_cover_url,
-                    "source_url": f"https://open.spotify.com/track/{uri}",
-                }
-            )
+    for i, item in enumerate(entity.get("trackList", []), start=1):
+        uri = item.get("uri", "").replace("spotify:track:", "")
+        if not uri:
+            continue
+        artists = _parse_subtitle_artists(item.get("subtitle"))
+        tracks.append(
+            {
+                "id": f"sp:{uri}",
+                "name": item.get("title", "Unknown Track"),
+                "artists": artists,
+                "album": album_name,
+                "album_artists": album_artists,
+                "track_number": i,
+                "disc_number": 1,
+                "cover_url": cover_url,
+                "source_url": f"https://open.spotify.com/track/{uri}",
+            }
+        )
     return tracks
 
 
@@ -134,46 +110,44 @@ def get_single_track(url):
         raise ValueError("Invalid Spotify track URL")
     track_id = match.group(1)
 
-    html = requests.get(url).text
+    entity = _fetch_spotify_embed(f"https://open.spotify.com/embed/track/{track_id}")
+    cover_url = _get_embed_cover(entity)
 
-    title = re.search(r'<meta name="twitter:title" content="([^"]+)"', html)
-    artist_matches = re.finditer(
-        r'<meta name="music:musician_description" content="([^"]+)"', html
-    )
-    image = re.search(r'<meta name="twitter:image" content="([^"]+)"', html)
+    artists = []
+    for a in entity.get("artists", []):
+        name = a.get("name")
+        if name:
+            artists.append(name)
+    if not artists:
+        artists = _parse_subtitle_artists(entity.get("subtitle"))
 
-    album_match = re.search(
-        r'<meta name="music:album" content="https://open\.spotify\.com/album/([^"]+)"',
-        html,
-    )
+    # Scrape the regular page to find the album name
     album_name = "Unknown Album"
-    if album_match:
-        try:
+    try:
+        html = requests.get(url).text
+        album_match = re.search(
+            r'<meta name="music:album" content="https://open\.spotify\.com/album/([^"]+)"',
+            html,
+        )
+        if album_match:
             album_id = album_match.group(1)
-            album = spotapi.PublicAlbum(album_id)
-            a_data = album.get_album_info().get("data", {}).get("albumUnion", {})
-            album_name = a_data.get("name", "Unknown Album")
-        except Exception:
-            pass
-
-    artist_names = []
-    for m in artist_matches:
-        parts = [a.strip() for a in m.group(1).split(",")]
-        artist_names.extend(parts)
-
-    if not title:
-        raise ValueError("Could not extract track metadata from the page HTML.")
+            album_entity = _fetch_spotify_embed(
+                f"https://open.spotify.com/embed/album/{album_id}"
+            )
+            album_name = album_entity.get("name", "Unknown Album")
+    except Exception:
+        pass
 
     return [
         {
             "id": f"sp:{track_id}",
-            "name": title.group(1),
-            "artists": artist_names,
+            "name": entity.get("title") or entity.get("name", "Unknown Track"),
+            "artists": artists,
             "album": album_name,
-            "album_artists": artist_names,
+            "album_artists": artists,
             "track_number": 1,
             "disc_number": 1,
-            "cover_url": image.group(1) if image else "",
+            "cover_url": cover_url,
             "source_url": url,
         }
     ]
@@ -188,19 +162,18 @@ def get_youtube_tracks(url):
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
         if not info:
-            raise ValueError("Could not extract metadata from YouTube URL.")
+            raise ValueError("Could not extract metadata from URL.")
 
         tracks = []
 
         if "entries" in info:
-            # It's a playlist or album
             for i, entry in enumerate(info["entries"], start=1):
                 if not entry:
                     continue
                 tracks.append(
                     {
                         "id": f"yt:{entry.get('id')}",
-                        "name": entry.get("title") or "Unknown YouTube Track",
+                        "name": entry.get("title") or "Unknown Track",
                         "artists": [entry.get("uploader") or "Unknown Artist"],
                         "album": info.get("title") or "YouTube Playlist",
                         "album_artists": [info.get("uploader") or "Various Artists"],
@@ -212,11 +185,10 @@ def get_youtube_tracks(url):
                     }
                 )
         else:
-            # It's a single video
             tracks.append(
                 {
                     "id": f"yt:{info.get('id')}",
-                    "name": info.get("title") or "Unknown YouTube Track",
+                    "name": info.get("title") or "Unknown Track",
                     "artists": [info.get("uploader") or "Unknown Artist"],
                     "album": "YouTube Music",
                     "album_artists": [info.get("uploader") or "Unknown Artist"],
@@ -249,8 +221,7 @@ def get_apple_music_tracks(url):
             album_name = ld_data.get("name", album_name)
 
             if "author" in ld_data:
-                author = ld_data["author"]
-                album_artists = [author.get("name", "Apple Music")]
+                album_artists = [ld_data["author"].get("name", "Apple Music")]
             elif "byArtist" in ld_data:
                 by_artist = ld_data["byArtist"]
                 if isinstance(by_artist, list):
