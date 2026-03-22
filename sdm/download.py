@@ -1,20 +1,61 @@
 import os
 import re
 import glob
-import requests
 import yt_dlp
-import imageio_ffmpeg
-from mutagen.mp4 import MP4, MP4Cover
-from mutagen.mp3 import MP3
-from mutagen.id3 import ID3, TIT2, TPE1, TALB, TPE2, TRCK, TPOS, TCON, TDRC, USLT, APIC
-from mutagen.flac import FLAC, Picture
-from mutagen.oggopus import OggOpus
-import base64
 from pathlib import Path
 import logging
-from sdm.metadata import get_itunes_metadata, get_lrclib_lyrics
+from threading import Lock
+from sdm.metadata import get_itunes_metadata, get_lrclib_lyrics, _session
 
 logging.getLogger("yt_dlp").setLevel(logging.ERROR)
+
+_cover_cache = {}
+_itunes_cache = {}
+_cache_lock = Lock()
+
+_ffmpeg_path = None
+
+def _get_ffmpeg_path():
+    global _ffmpeg_path
+    if _ffmpeg_path is None:
+        import shutil
+
+        system_ffmpeg = shutil.which("ffmpeg")
+        if system_ffmpeg:
+            _ffmpeg_path = system_ffmpeg
+        else:
+            import imageio_ffmpeg
+
+            _ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+    return _ffmpeg_path
+
+
+def _get_cached_cover(cover_url):
+    """Download cover art with caching. Returns bytes or None."""
+    if not cover_url:
+        return None
+    with _cache_lock:
+        if cover_url in _cover_cache:
+            return _cover_cache[cover_url]
+    try:
+        data = _session.get(cover_url, timeout=10).content
+    except Exception:
+        data = None
+    with _cache_lock:
+        _cover_cache[cover_url] = data
+    return data
+
+
+def _get_cached_itunes(track_name, artist_name):
+    """Fetch iTunes metadata with caching. Returns (genre, release_date)."""
+    key = (artist_name.lower().strip(), track_name.lower().strip())
+    with _cache_lock:
+        if key in _itunes_cache:
+            return _itunes_cache[key]
+    genre, release_date = get_itunes_metadata(track_name, artist_name)
+    with _cache_lock:
+        _itunes_cache[key] = (genre, release_date)
+    return genre, release_date
 
 
 class YTDLLogger:
@@ -80,6 +121,42 @@ def sanitize_ytdlp_error(error_msg):
     return error_msg
 
 
+def _score_match(entry, target_title, target_artist, target_duration_ms):
+    """Score a YouTube search result against target track metadata."""
+    from difflib import SequenceMatcher
+
+    score = 0
+
+    entry_duration = entry.get("duration")  # seconds
+    if entry_duration and target_duration_ms:
+        diff_ms = abs(entry_duration * 1000 - target_duration_ms)
+        if diff_ms < 3000:
+            score += 40  
+        elif diff_ms < 10000:
+            score += 25  
+        elif diff_ms < 30000:
+            score += 10  
+
+    entry_title = (entry.get("title") or "").lower()
+    title_ratio = SequenceMatcher(None, target_title.lower(), entry_title).ratio()
+    score += int(title_ratio * 30)
+
+    channel = (entry.get("uploader") or entry.get("channel") or "").lower()
+    if target_artist.lower() in channel:
+        score += 20
+    elif SequenceMatcher(None, target_artist.lower(), channel).ratio() > 0.6:
+        score += 10
+
+    if "official" in entry_title or "audio" in entry_title:
+        score += 10
+
+    if any(w in entry_title for w in ["remix", "live", "cover", "karaoke"]):
+        if not any(w in target_title.lower() for w in ["remix", "live", "cover"]):
+            score -= 15
+
+    return score
+
+
 def embed_metadata(filepath, track, fetch_lyrics=False):
     ext = filepath.suffix.lower()
     name = str(track.get("name", "Unknown"))
@@ -94,23 +171,19 @@ def embed_metadata(filepath, track, fetch_lyrics=False):
     track_total = int(track.get("tracks_count") or track_num)
     disc_num = int(track.get("disc_number") or 1)
 
-    genre, release_date = get_itunes_metadata(name, primary_artist)
+    genre, release_date = _get_cached_itunes(name, primary_artist)
     lyrics = ""
     if fetch_lyrics:
         lyrics = get_lrclib_lyrics(
             name, primary_artist, album_name if album_name != "Unknown Album" else None
         )
 
-    cover_data = None
-    cover_url = track.get("cover_url")
-    if cover_url:
-        try:
-            cover_data = requests.get(cover_url).content
-        except Exception:
-            pass
+    cover_data = _get_cached_cover(track.get("cover_url"))
 
     try:
         if ext == ".m4a":
+            from mutagen.mp4 import MP4, MP4Cover
+
             audio = MP4(filepath)
             audio["\xa9nam"] = [name]
             audio["\xa9ART"] = [primary_artist]
@@ -135,6 +208,21 @@ def embed_metadata(filepath, track, fetch_lyrics=False):
             return True
 
         elif ext == ".mp3":
+            from mutagen.mp3 import MP3
+            from mutagen.id3 import (
+                ID3,
+                TIT2,
+                TPE1,
+                TALB,
+                TPE2,
+                TRCK,
+                TPOS,
+                TCON,
+                TDRC,
+                USLT,
+                APIC,
+            )
+
             try:
                 audio = MP3(filepath, ID3=ID3)
             except Exception:
@@ -167,9 +255,16 @@ def embed_metadata(filepath, track, fetch_lyrics=False):
             return True
 
         elif ext in [".flac", ".opus"]:
+            from mutagen.flac import Picture
+            import base64
+
             if ext == ".flac":
+                from mutagen.flac import FLAC
+
                 audio = FLAC(filepath)
             else:
+                from mutagen.oggopus import OggOpus
+
                 audio = OggOpus(filepath)
 
             audio["TITLE"] = name
@@ -223,49 +318,24 @@ def get_zen_profile_path():
     return None
 
 
-def download_and_tag(
-    track,
-    output_dir,
-    track_index,
+def build_ydl_opts(
     cookies_source=None,
     format_flag="m4a",
-    fallback=False,
     sponsor_block=False,
     normalize=False,
-    fetch_lyrics=False,
 ):
-    title = sanitize_filename(track.get("name"))
-    artists = track.get("artists", [])
-    artist = sanitize_filename(artists[0] if artists else "Unknown")
-
-    filename_template = f"{track_index:02d} - {artist} - {title}"
-    base_filepath = Path(output_dir) / filename_template
-
-    direct_url = track.get("direct_url")
-    search_query = f"{artist} - {title} audio"
-    yt_logger = YTDLLogger()
-
+    """Build YoutubeDL options shared across all tracks in a batch."""
     postprocessors = [{"key": "FFmpegExtractAudio", "preferredcodec": format_flag}]
 
-    if normalize:
-        postprocessors.append(
-            {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": format_flag,
-            }
-        )
-
     ydl_opts = {
-        "ffmpeg_location": imageio_ffmpeg.get_ffmpeg_exe(),
+        "ffmpeg_location": _get_ffmpeg_path(),
         "format": f"{format_flag}/bestaudio/best",
-        "outtmpl": str(base_filepath) + ".%(ext)s",
         "postprocessors": postprocessors,
         "quiet": True,
         "no_warnings": True,
         "nocheckcertificate": True,
         "geo_bypass": True,
-        "logger": yt_logger,
-        "extract_flat": "in_playlist",  # Extract metadata only to safely iterate fallbacks
+        "extract_flat": "in_playlist",
     }
 
     if normalize:
@@ -288,135 +358,178 @@ def download_and_tag(
             zen_path = get_zen_profile_path()
             if zen_path:
                 ydl_opts["cookiesfrombrowser"] = ("firefox", zen_path, None, None)
-            else:
-                return "error", "Zen Browser profile not found"
         else:
             ydl_opts["cookiesfrombrowser"] = (cookies_source, None, None, None)
+
+    return ydl_opts
+
+
+def download_and_tag(
+    track,
+    output_dir,
+    track_index,
+    cookies_source=None,
+    format_flag="m4a",
+    fallback=False,
+    sponsor_block=False,
+    normalize=False,
+    fetch_lyrics=False,
+    ydl=None,
+):
+    title = sanitize_filename(track.get("name"))
+    artists = track.get("artists", [])
+    artist = sanitize_filename(artists[0] if artists else "Unknown")
+
+    filename_template = f"{track_index:02d} - {artist} - {title}"
+    base_filepath = Path(output_dir) / filename_template
+
+    direct_url = track.get("direct_url")
+    search_query = f"{artist} - {title} audio"
+    yt_logger = YTDLLogger()
+
+    own_ydl = False
+    if ydl is not None:
+        ydl.params["outtmpl"]["default"] = str(base_filepath) + ".%(ext)s"
+        ydl.params["logger"] = yt_logger
+    else:
+        own_ydl = True
+        ydl_opts = build_ydl_opts(cookies_source, format_flag, sponsor_block, normalize)
+        ydl_opts["outtmpl"] = str(base_filepath) + ".%(ext)s"
+        ydl_opts["logger"] = yt_logger
+        ydl = yt_dlp.YoutubeDL(ydl_opts)
 
     last_error_message = "No search results found"
 
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        try:
+            if direct_url:
+                info = {"entries": [{"url": direct_url}]}
+            else:
+                info = ydl.extract_info(f"ytsearch3:{search_query}", download=False)
+        except Exception as e:
+            return "error", sanitize_ytdlp_error(str(e))
+
+        if not info or "entries" not in info or not info["entries"]:
+            return "error", "No search results found"
+
+        entries = [e for e in info["entries"] if e]
+        target_duration = track.get("duration")
+        if not direct_url and target_duration:
+            scored = [
+                (e, _score_match(e, title, artist, target_duration)) for e in entries
+            ]
+            scored.sort(key=lambda x: x[1], reverse=True)
+            entries = [e for e, s in scored]
+
+        for entry in entries:
+            if not entry:
+                continue
+
+            video_url = entry.get("url") or entry.get("webpage_url")
+            if not video_url:
+                continue
+
+            yt_logger.last_error = ""
+
             try:
-                if direct_url:
-                    info = {"entries": [{"url": direct_url}]}
+                # Attempt to download the specific video
+                download_info = ydl.extract_info(video_url, download=True)
+
+                final_filepath = None
+                if (
+                    "requested_downloads" in download_info
+                    and download_info["requested_downloads"]
+                ):
+                    final_filepath = download_info["requested_downloads"][0].get(
+                        "filepath"
+                    )
+
+                if not final_filepath:
+                    final_filepath = str(base_filepath) + f".{format_flag}"
+
+                final_path_obj = Path(final_filepath)
+
+                if final_path_obj.exists():
+                    embed_metadata(final_path_obj, track, fetch_lyrics)
+                    return "success", final_path_obj.name
+
+            except yt_dlp.utils.DownloadError as e:
+                error_msg = str(e)
+                if (
+                    "Sign in to confirm your age" in error_msg
+                    or "Sign in to confirm your age" in yt_logger.last_error
+                ):
+                    last_error_message = "Age restricted content"
+                elif (
+                    "DPAPI" in error_msg
+                    or "decrypt" in error_msg
+                    or "DPAPI" in yt_logger.last_error
+                    or "decrypt" in yt_logger.last_error
+                ):
+                    return "encryption_error", "Browser cookies are encrypted"
+                elif (
+                    "locked" in error_msg.lower()
+                    or "locked" in yt_logger.last_error.lower()
+                ):
+                    return "error", "Cookie database is locked. Close your browser."
                 else:
-                    info = ydl.extract_info(f"ytsearch3:{search_query}", download=False)
+                    clean_error = (
+                        yt_logger.last_error if yt_logger.last_error else error_msg
+                    )
+                    last_error_message = sanitize_ytdlp_error(clean_error)
+                continue
+
             except Exception as e:
-                return "error", sanitize_ytdlp_error(str(e))
+                last_error_message = sanitize_ytdlp_error(str(e))
+                continue
 
-            if not info or "entries" not in info or not info["entries"]:
-                return "error", "No search results found"
+        # If we exhausted all 3 entries and none worked
+        is_drm_blocked = (
+            "YouTube DRM blocked audio stream" in last_error_message
+            or "Age restricted" in last_error_message
+        )
 
-            # Iterate through the top 3 results
-            for entry in info["entries"]:
-                if not entry:
-                    continue
+        if fallback and is_drm_blocked:
+            yt_logger.last_error = ""
+            try:
+                sc_info = ydl.extract_info(f"scsearch1:{search_query}", download=False)
+                if sc_info and "entries" in sc_info and sc_info["entries"]:
+                    sc_entry = sc_info["entries"][0]
+                    sc_url = sc_entry.get("url")
+                    if sc_url:
+                        download_info = ydl.extract_info(sc_url, download=True)
+                        final_filepath = None
+                        if (
+                            "requested_downloads" in download_info
+                            and download_info["requested_downloads"]
+                        ):
+                            final_filepath = download_info["requested_downloads"][
+                                0
+                            ].get("filepath")
+                        if not final_filepath:
+                            final_filepath = str(base_filepath) + f".{format_flag}"
 
-                video_url = entry.get("url") or entry.get("webpage_url")
-                if not video_url:
-                    continue
-
-                yt_logger.last_error = ""
-
-                try:
-                    # Attempt to download the specific video
-                    download_info = ydl.extract_info(video_url, download=True)
-
-                    final_filepath = None
-                    if (
-                        "requested_downloads" in download_info
-                        and download_info["requested_downloads"]
-                    ):
-                        final_filepath = download_info["requested_downloads"][0].get(
-                            "filepath"
-                        )
-
-                    if not final_filepath:
-                        final_filepath = str(base_filepath) + f".{format_flag}"
-
-                    final_path_obj = Path(final_filepath)
-
-                    if final_path_obj.exists():
-                        embed_metadata(final_path_obj, track, fetch_lyrics)
-                        return "success", final_path_obj.name
-
-                except yt_dlp.utils.DownloadError as e:
-                    error_msg = str(e)
-                    if (
-                        "Sign in to confirm your age" in error_msg
-                        or "Sign in to confirm your age" in yt_logger.last_error
-                    ):
-                        last_error_message = "Age restricted content"
-                    elif (
-                        "DPAPI" in error_msg
-                        or "decrypt" in error_msg
-                        or "DPAPI" in yt_logger.last_error
-                        or "decrypt" in yt_logger.last_error
-                    ):
-                        return "encryption_error", "Browser cookies are encrypted"
-                    elif (
-                        "locked" in error_msg.lower()
-                        or "locked" in yt_logger.last_error.lower()
-                    ):
-                        return "error", "Cookie database is locked. Close your browser."
-                    else:
-                        clean_error = (
-                            yt_logger.last_error if yt_logger.last_error else error_msg
-                        )
-                        last_error_message = sanitize_ytdlp_error(clean_error)
-                    continue
-
-                except Exception as e:
-                    last_error_message = sanitize_ytdlp_error(str(e))
-                    continue
-
-            # If we exhausted all 3 entries and none worked
-            is_drm_blocked = (
-                "YouTube DRM blocked audio stream" in last_error_message
-                or "Age restricted" in last_error_message
+                        final_path_obj = Path(final_filepath)
+                        if final_path_obj.exists():
+                            embed_metadata(final_path_obj, track, fetch_lyrics)
+                            return "fallback_success", final_path_obj.name
+            except Exception as e:
+                last_error_message = sanitize_ytdlp_error(str(e))
+        elif is_drm_blocked:
+            return (
+                "drm_blocked",
+                "YouTube DRM blocked audio stream (Upstream yt-dlp issue)",
             )
 
-            if fallback and is_drm_blocked:
-                yt_logger.last_error = ""
-                try:
-                    sc_info = ydl.extract_info(
-                        f"scsearch1:{search_query}", download=False
-                    )
-                    if sc_info and "entries" in sc_info and sc_info["entries"]:
-                        sc_entry = sc_info["entries"][0]
-                        sc_url = sc_entry.get("url")
-                        if sc_url:
-                            download_info = ydl.extract_info(sc_url, download=True)
-                            final_filepath = None
-                            if (
-                                "requested_downloads" in download_info
-                                and download_info["requested_downloads"]
-                            ):
-                                final_filepath = download_info["requested_downloads"][
-                                    0
-                                ].get("filepath")
-                            if not final_filepath:
-                                final_filepath = str(base_filepath) + f".{format_flag}"
+        if last_error_message == "Age restricted content":
+            return "age_restricted", "All 3 search results were age restricted"
+        elif last_error_message == "Browser cookies are encrypted":
+            return "encryption_error", last_error_message
 
-                            final_path_obj = Path(final_filepath)
-                            if final_path_obj.exists():
-                                embed_metadata(final_path_obj, track, fetch_lyrics)
-                                return "fallback_success", final_path_obj.name
-                except Exception as e:
-                    last_error_message = sanitize_ytdlp_error(str(e))
-            elif is_drm_blocked:
-                return (
-                    "drm_blocked",
-                    "YouTube DRM blocked audio stream (Upstream yt-dlp issue)",
-                )
-
-            if last_error_message == "Age restricted content":
-                return "age_restricted", "All 3 search results were age restricted"
-            elif last_error_message == "Browser cookies are encrypted":
-                return "encryption_error", last_error_message
-
-            return "error", f"All 3 search results failed ({last_error_message})"
+        return "error", f"All 3 search results failed ({last_error_message})"
 
     except Exception as e:
         return "error", sanitize_ytdlp_error(str(e))
+    finally:
+        if own_ydl:
+            ydl.close()

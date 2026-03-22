@@ -3,9 +3,20 @@ import json
 import requests
 import yt_dlp
 
+_session = requests.Session()
+_session.headers.update(
+    {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
+        )
+    }
+)
+_DEFAULT_TIMEOUT = 10
+
 
 def _fetch_spotify_embed(embed_url):
-    html = requests.get(embed_url).text
+    html = _session.get(embed_url, timeout=_DEFAULT_TIMEOUT).text
     match = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html)
     if not match:
         raise ValueError("Could not extract Spotify embed data.")
@@ -63,6 +74,7 @@ def get_playlist_tracks(url):
                 "album_artists": artists,
                 "track_number": i,
                 "disc_number": 1,
+                "duration": item.get("duration"),
                 "cover_url": cover_url,
                 "source_url": f"https://open.spotify.com/track/{uri}",
             }
@@ -97,6 +109,7 @@ def get_album_tracks(url):
                 "album_artists": album_artists,
                 "track_number": i,
                 "disc_number": 1,
+                "duration": item.get("duration"),
                 "cover_url": cover_url,
                 "source_url": f"https://open.spotify.com/track/{uri}",
             }
@@ -124,7 +137,7 @@ def get_single_track(url):
     # Scrape the regular page to find the album name
     album_name = "Unknown Album"
     try:
-        html = requests.get(url).text
+        html = _session.get(url, timeout=_DEFAULT_TIMEOUT).text
         album_match = re.search(
             r'<meta name="music:album" content="https://open\.spotify\.com/album/([^"]+)"',
             html,
@@ -147,6 +160,7 @@ def get_single_track(url):
             "album_artists": artists,
             "track_number": 1,
             "disc_number": 1,
+            "duration": entity.get("duration"),
             "cover_url": cover_url,
             "source_url": url,
         }
@@ -203,10 +217,8 @@ def get_youtube_tracks(url):
 
 
 def get_apple_music_tracks(url):
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
-    }
-    html = requests.get(url, headers=headers).text
+   
+    html = _session.get(url, timeout=_DEFAULT_TIMEOUT).text
 
     album_name = "Apple Music"
     album_artists = ["Unknown Artist"]
@@ -355,7 +367,7 @@ def get_itunes_metadata(track_name, artist_name):
         url = "https://itunes.apple.com/search"
         query = f"{artist_name} {track_name}"
         params = {"term": query, "media": "music", "limit": 1}
-        res = requests.get(url, params=params, timeout=5).json()
+        res = _session.get(url, params=params, timeout=5).json()
         if res.get("results"):
             t = res["results"][0]
             return t.get("primaryGenreName"), t.get("releaseDate")
@@ -370,7 +382,7 @@ def get_lrclib_lyrics(track_name, artist_name, album_name=None):
         params = {"track_name": track_name, "artist_name": artist_name}
         if album_name:
             params["album_name"] = album_name
-        res = requests.get(url, params=params, timeout=5).json()
+        res = _session.get(url, params=params, timeout=5).json()
         return res.get("syncedLyrics") or res.get("plainLyrics")
     except Exception:
         pass

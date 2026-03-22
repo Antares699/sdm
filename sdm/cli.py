@@ -1,7 +1,5 @@
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import subprocess
-import imageio_ffmpeg
 import typer
 from enum import Enum
 
@@ -17,7 +15,13 @@ from rich.table import Table
 from rich.prompt import Confirm
 
 from sdm.metadata import fetch_tracks
-from sdm.download import download_and_tag, sanitize_filename, embed_metadata
+from sdm.download import (
+    download_and_tag,
+    sanitize_filename,
+    embed_metadata,
+    _get_ffmpeg_path,
+    build_ydl_opts,
+)
 from sdm.sync import SyncManager
 
 app = typer.Typer(
@@ -123,6 +127,15 @@ def execute_sync_or_download(
             f"{action_verb} {len(tracks_to_download)} tracks using {workers} workers..."
         )
 
+        import threading
+        import yt_dlp
+
+        shared_ydl_opts = build_ydl_opts(
+            cookies, format.value, sponsor_block, normalize
+        )
+        worker_ydl_instances = {}
+        _ydl_lock = threading.Lock()
+
         def worker(index, track, is_synced):
             title = track.get("name", "Unknown")
             if dry_run:
@@ -132,7 +145,7 @@ def execute_sync_or_download(
                     return "dry_run_refresh", "Simulated refresh"
 
             if is_synced:
-                filename = sync_manager.data["tracks"].get(track["id"])
+                filename = sync_manager.get_filename(track["id"])
                 if not filename:
                     return "error", "Filename not found in sync index"
                 filepath = output_dir / filename
@@ -143,16 +156,23 @@ def execute_sync_or_download(
                 else:
                     return "error", "Failed to refresh metadata"
             else:
+                # Get or create a per-worker ydl instance
+                tid = threading.current_thread().ident
+                with _ydl_lock:
+                    if tid not in worker_ydl_instances:
+                        worker_ydl_instances[tid] = yt_dlp.YoutubeDL(
+                            dict(shared_ydl_opts)
+                        )
+                ydl_instance = worker_ydl_instances[tid]
+
                 return download_and_tag(
                     track,
                     output_dir,
                     index,
-                    cookies,
-                    format.value,
-                    False,
-                    sponsor_block,
-                    normalize,
-                    lyrics,
+                    format_flag=format.value,
+                    fallback=False,
+                    fetch_lyrics=lyrics,
+                    ydl=ydl_instance,
                 )
 
         with Progress(
@@ -238,6 +258,16 @@ def execute_sync_or_download(
                         )
 
                     progress.advance(main_task)
+
+        # Flush any remaining batched sync data to disk
+        sync_manager.flush()
+
+        # Clean up per-worker yt-dlp instances
+        for ydl_inst in worker_ydl_instances.values():
+            try:
+                ydl_inst.close()
+            except Exception:
+                pass
     else:
         console.print("[green]All tracks are already up to date.[/green]")
 
@@ -314,12 +344,12 @@ def execute_sync_or_download(
                             track,
                             output_dir,
                             index,
-                            cookies,
-                            format.value,
-                            True,
-                            sponsor_block,
-                            normalize,
-                            lyrics,
+                            cookies_source=cookies,
+                            format_flag=format.value,
+                            fallback=True,
+                            sponsor_block=sponsor_block,
+                            normalize=normalize,
+                            fetch_lyrics=lyrics,
                         )
                         if f_status in ["fallback_success", "success"]:
                             sync_manager.mark_synced(track["id"], f_message)
@@ -343,6 +373,9 @@ def execute_sync_or_download(
                 f'  sdm inject "your_file.mp3" "<track_url>" -o "{output_dir}"'
             )
 
+        # Flush any sync data from DRM fallback downloads
+        sync_manager.flush()
+
     if not dry_run:
         m3u_path = output_dir / "_playlist.m3u"
         try:
@@ -350,7 +383,7 @@ def execute_sync_or_download(
                 f.write("#EXTM3U\n")
                 for t in tracks:
                     t_id = t.get("id")
-                    fname = sync_manager.data["tracks"].get(t_id)
+                    fname = sync_manager.get_filename(t_id)
                     if fname:
                         f.write(f"{fname}\n")
         except Exception as e:
@@ -603,7 +636,10 @@ def inject(
 
         console.print(f"[cyan]Converting and importing {filename_template}...[/cyan]")
 
-        cmd = [imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-i", str(file)]
+        import subprocess
+
+        # Use the shared cached ffmpeg path (with system PATH detection)
+        cmd = [_get_ffmpeg_path(), "-y", "-i", str(file)]
 
         codec = {"m4a": "aac", "mp3": "libmp3lame", "flac": "flac", "opus": "libopus"}[
             format.value

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sdm-pycli"
-version = "1.1.1"
+version = "1.2.0"
 description = "A fast, zero-config CLI tool to download and sync playlists from Spotify, Apple Music, Tidal, YouTube, and SoundCloud."
 readme = "README.md"
 authors = [
