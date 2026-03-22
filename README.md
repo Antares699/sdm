@@ -18,6 +18,11 @@ Recently, Spotify restricted their Web API, requiring developers to have a Premi
 
 ## Installation
 
+You must have [Python 3.8+](https://www.python.org/downloads/) installed on your system. 
+*(Windows users: Make sure to check the "Add Python to PATH" box during installation!)*
+
+Install directly from PyPI:
+
 ```bash
 pip install sdm-pycli
 ```
