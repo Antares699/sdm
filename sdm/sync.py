@@ -2,6 +2,7 @@ import json
 import sqlite3
 from pathlib import Path
 
+
 class SyncManager:
     def __init__(self, output_dir, is_static=False):
         self.output_dir = Path(output_dir)
@@ -161,6 +162,7 @@ class SyncManager:
             r[0] for r in self.conn.execute("SELECT track_id FROM injected").fetchall()
         )
 
+        valid_filenames = set()
         ids_to_remove = []
         for track_id, filename in rows:
             if track_id not in current_spotify_ids and track_id not in injected_ids:
@@ -175,6 +177,8 @@ class SyncManager:
 
                 if not dry_run:
                     ids_to_remove.append(track_id)
+            else:
+                valid_filenames.add(filename)
 
         if not dry_run and ids_to_remove:
             with self.conn:
@@ -182,5 +186,17 @@ class SyncManager:
                     "DELETE FROM tracks WHERE track_id = ?",
                     [(tid,) for tid in ids_to_remove],
                 )
+
+        audio_extensions = {".m4a", ".mp3", ".flac", ".opus"}
+        if self.output_dir.exists():
+            for f in self.output_dir.iterdir():
+                if f.is_file() and f.suffix.lower() in audio_extensions:
+                    if f.name not in valid_filenames and f.name not in deleted_files:
+                        deleted_files.append(f.name)
+                        if not dry_run:
+                            try:
+                                f.unlink()
+                            except Exception:
+                                pass
 
         return deleted_files

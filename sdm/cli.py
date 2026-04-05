@@ -68,6 +68,8 @@ def execute_sync_or_download(
             is_static = True
         elif "soundcloud.com" in url_str and "/sets/" not in url_str:
             is_static = True
+        elif "soundcloud.com" in url_str and "/sets/" not in url_str:
+            is_static = True
 
     sync_manager = SyncManager(output_dir, is_static=is_static)
     source_url = url

@@ -79,7 +79,7 @@ _token_expiry = 0
 
 
 def _fetch_spotify_embed(embed_url):
-    html = _session.get(embed_url, timeout=_DEFAULT_TIMEOUT).text
+    html = _session.get(embed_url, timeout=_DEFAULT_TIMEOUT).content.decode("utf-8")
     match = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html)
     if not match:
         raise ValueError("Could not extract Spotify embed data.")
@@ -131,7 +131,7 @@ def _scrape_track_page(track_id):
         url = f"https://open.spotify.com/track/{track_id}"
         html = _session.get(
             url, timeout=_DEFAULT_TIMEOUT, headers=_CRAWLER_HEADERS
-        ).text
+        ).content.decode("utf-8")
     except Exception:
         return result
 
@@ -626,9 +626,14 @@ def get_playlist_tracks(url):
     playlist_id = match.group(1)
     p = spotapi.PublicPlaylist(playlist_id)
     raw_tracks = []
-    for page in p.paginate_playlist():
-        if isinstance(page, dict) and "items" in page:
-            raw_tracks.extend(page["items"])
+    try:
+        for page in p.paginate_playlist():
+            if isinstance(page, dict) and "items" in page:
+                raw_tracks.extend(page["items"])
+    except KeyError as e:
+        if "content" in str(e):
+            raise ValueError("Playlist not found or is private on Spotify.")
+        raise
     return _parse_spotapi_track_list(raw_tracks)
 
 
@@ -652,8 +657,23 @@ def get_album_tracks(url):
     info = a.get_album_info()
     album_data = info.get("data", {}).get("albumUnion", {})
 
+    real_album_name = album_data.get("name", "Unknown Album")
+    real_album_artists = []
+    if "artists" in album_data and "items" in album_data["artists"]:
+        real_album_artists = [
+            a.get("profile", {}).get("name", "") for a in album_data["artists"]["items"]
+        ]
+    real_album_artists = [a for a in real_album_artists if a] or ["Unknown Artist"]
+
     tracks = _parse_spotapi_track_list(raw_tracks)
     for t in tracks:
+        if t.get("album") == "Unknown Album":
+            t["album"] = real_album_name
+        if not t.get("album_artists") or t.get("album_artists") == ["Unknown Artist"]:
+            t["album_artists"] = real_album_artists
+        if not t.get("_album_uri"):
+            t["_album_uri"] = album_data.get("uri", "")
+
         if not t.get("cover_url"):
             cover_sources = album_data.get("coverArt", {}).get("sources", [])
             if cover_sources:
@@ -699,20 +719,23 @@ def get_youtube_tracks(url):
             for i, entry in enumerate(info["entries"], start=1):
                 if not entry:
                     continue
-                tracks.append(
-                    {
-                        "id": f"yt:{entry.get('id')}",
-                        "name": entry.get("title") or "Unknown Track",
-                        "artists": [entry.get("uploader") or "Unknown Artist"],
-                        "album": info.get("title") or "YouTube Playlist",
-                        "album_artists": [info.get("uploader") or "Various Artists"],
-                        "track_number": i,
-                        "disc_number": 1,
-                        "cover_url": entry.get("thumbnail") or "",
-                        "source_url": entry.get("url") or entry.get("webpage_url"),
-                        "direct_url": entry.get("url") or entry.get("webpage_url"),
-                    }
-                )
+                    tracks.append(
+                        {
+                            "id": f"yt:{entry.get('id')}",
+                            "name": entry.get("title") or "Unknown Track",
+                            "artists": [entry.get("uploader") or "Unknown Artist"],
+                            "album": info.get("title") or "YouTube Playlist",
+                            "album_artists": [
+                                info.get("uploader") or "Various Artists"
+                            ],
+                            "track_number": i,
+                            "disc_number": 1,
+                            "tracks_count": 0,
+                            "cover_url": entry.get("thumbnail") or "",
+                            "source_url": entry.get("url") or entry.get("webpage_url"),
+                            "direct_url": entry.get("url") or entry.get("webpage_url"),
+                        }
+                    )
         else:
             tracks.append(
                 {
@@ -723,16 +746,22 @@ def get_youtube_tracks(url):
                     "album_artists": [info.get("uploader") or "Unknown Artist"],
                     "track_number": 1,
                     "disc_number": 1,
+                    "tracks_count": 1,
                     "cover_url": info.get("thumbnail") or "",
                     "source_url": url,
                     "direct_url": url,
                 }
             )
+
+        total_tracks = len(tracks)
+        for t in tracks:
+            t["tracks_count"] = total_tracks
+
         return tracks
 
 
 def get_apple_music_tracks(url):
-    html = _session.get(url, timeout=_DEFAULT_TIMEOUT).text
+    html = _session.get(url, timeout=_DEFAULT_TIMEOUT).content.decode("utf-8")
 
     album_name = "Apple Music"
     album_artists = ["Unknown Artist"]
@@ -836,11 +865,16 @@ def get_apple_music_tracks(url):
                                     "album_artists": album_artists,
                                     "track_number": track_num,
                                     "disc_number": 1,
+                                    "tracks_count": 0,
                                     "cover_url": cover_url,
                                     "source_url": track_url,
                                     "direct_url": None,
                                 }
                             )
+
+    total_tracks = len(tracks)
+    for t in tracks:
+        t["tracks_count"] = total_tracks
 
     if "?i=" in url:
         adam_match = re.search(r"\?i=(\d+)", url)

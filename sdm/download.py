@@ -24,9 +24,11 @@ _ytmusic_lock = Lock()
 
 _thread_local = threading.local()
 
+
 def _get_ydl(opts, outtmpl, logger):
     if not hasattr(_thread_local, "ydl"):
         import copy
+
         base_opts = copy.deepcopy(opts)
         base_opts["outtmpl"] = outtmpl
         base_opts["logger"] = logger
@@ -39,14 +41,24 @@ def _get_ydl(opts, outtmpl, logger):
         _thread_local.ydl.params["logger"] = logger
     return _thread_local.ydl
 
+
 def _apply_twopass_loudnorm(filepath, format_flag):
     temp_filepath = filepath.with_suffix(f".temp.{format_flag}")
-    codec = {"m4a": "aac", "mp3": "libmp3lame", "flac": "flac", "opus": "libopus"}.get(format_flag, "aac")
-    
+    codec = {"m4a": "aac", "mp3": "libmp3lame", "flac": "flac", "opus": "libopus"}.get(
+        format_flag, "aac"
+    )
+
     cmd1 = [
-        _get_ffmpeg_path(), "-y", "-hide_banner", "-i", str(filepath),
-        "-af", "loudnorm=I=-14:LRA=11:TP=-1.5:print_format=json",
-        "-f", "null", "-"
+        _get_ffmpeg_path(),
+        "-y",
+        "-hide_banner",
+        "-i",
+        str(filepath),
+        "-af",
+        "loudnorm=I=-14:LRA=11:TP=-1.5:print_format=json",
+        "-f",
+        "null",
+        "-",
     ]
     try:
         res = subprocess.run(cmd1, capture_output=True, text=True, check=True)
@@ -54,20 +66,28 @@ def _apply_twopass_loudnorm(filepath, format_flag):
         if not match:
             raise ValueError("No JSON found in Pass 1 output")
         stats = json.loads(match.group(0))
-        
+
         measured_i = stats.get("input_i")
         measured_lra = stats.get("input_lra")
         measured_tp = stats.get("input_tp")
         measured_thresh = stats.get("input_thresh")
         target_offset = stats.get("target_offset")
 
-        if not all([measured_i, measured_lra, measured_tp, measured_thresh, target_offset]):
+        if not all(
+            [measured_i, measured_lra, measured_tp, measured_thresh, target_offset]
+        ):
             raise ValueError("Missing values in JSON")
 
         cmd2 = [
-            _get_ffmpeg_path(), "-y", "-hide_banner", "-i", str(filepath),
-            "-af", f"loudnorm=I=-14:LRA=11:TP=-1.5:measured_I={measured_i}:measured_LRA={measured_lra}:measured_TP={measured_tp}:measured_thresh={measured_thresh}:offset={target_offset}:linear=true",
-            "-c:a", codec
+            _get_ffmpeg_path(),
+            "-y",
+            "-hide_banner",
+            "-i",
+            str(filepath),
+            "-af",
+            f"loudnorm=I=-14:LRA=11:TP=-1.5:measured_I={measured_i}:measured_LRA={measured_lra}:measured_TP={measured_tp}:measured_thresh={measured_thresh}:offset={target_offset}:linear=true",
+            "-c:a",
+            codec,
         ]
         if format_flag == "mp3":
             cmd2.extend(["-q:a", "2"])
@@ -89,9 +109,15 @@ def _apply_twopass_loudnorm(filepath, format_flag):
                 pass
 
         cmd_fallback = [
-            _get_ffmpeg_path(), "-y", "-hide_banner", "-i", str(filepath),
-            "-af", "loudnorm=I=-14:LRA=11:TP=-1.5",
-            "-c:a", codec
+            _get_ffmpeg_path(),
+            "-y",
+            "-hide_banner",
+            "-i",
+            str(filepath),
+            "-af",
+            "loudnorm=I=-14:LRA=11:TP=-1.5",
+            "-c:a",
+            codec,
         ]
         if format_flag == "mp3":
             cmd_fallback.extend(["-q:a", "2"])
@@ -100,7 +126,7 @@ def _apply_twopass_loudnorm(filepath, format_flag):
         elif format_flag == "opus":
             cmd_fallback.extend(["-b:a", "128k"])
         cmd_fallback.extend(["-vn", str(temp_filepath)])
-        
+
         try:
             subprocess.run(cmd_fallback, capture_output=True, check=True)
             if temp_filepath.exists():
@@ -112,6 +138,7 @@ def _apply_twopass_loudnorm(filepath, format_flag):
                 except Exception:
                     pass
 
+
 def _get_ytmusic():
     global _ytmusic
     if _ytmusic is None:
@@ -121,6 +148,7 @@ def _get_ytmusic():
 
                 _ytmusic = YTMusic()
     return _ytmusic
+
 
 def _get_ffmpeg_path():
     global _ffmpeg_path
@@ -136,6 +164,7 @@ def _get_ffmpeg_path():
             _ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
     return _ffmpeg_path
 
+
 def _get_cached_cover(cover_url):
     if not cover_url:
         return None
@@ -149,6 +178,7 @@ def _get_cached_cover(cover_url):
     with _cache_lock:
         _cover_cache[cover_url] = data
     return data
+
 
 class YTDLLogger:
     def __init__(self):
@@ -166,9 +196,19 @@ class YTDLLogger:
     def error(self, msg):
         self.last_error = msg
 
+
 def sanitize_filename(name):
     safe_name = str(name or "Unknown")
+    safe_name = (
+        safe_name.replace("’", "'")
+        .replace("‘", "'")
+        .replace("“", '"')
+        .replace("”", '"')
+        .replace("–", "-")
+    )
+    safe_name = safe_name.encode("ascii", "ignore").decode("ascii")
     return re.sub(r'[\\/*?:"<>|]', "", safe_name).strip()
+
 
 def sanitize_ytdlp_error(error_msg):
     if not error_msg:
@@ -192,6 +232,9 @@ def sanitize_ytdlp_error(error_msg):
     error_msg = re.sub(
         r"Use --cookies-from-browser.*", "Requires cookies to bypass.", error_msg
     )
+
+    if "WinError 32" in error_msg:
+        return "File temporarily locked by OS during rename (WinError 32)"
     error_msg = re.sub(
         r"Sign in to confirm you.*?re not a bot.*",
         "YouTube DRM blocked audio stream (Upstream yt-dlp issue)",
@@ -207,8 +250,12 @@ def sanitize_ytdlp_error(error_msg):
         error_msg,
     )
 
+    if "[WinError 32]" in error_msg:
+        return "File temporarily locked by OS during rename (WinError 32)"
+
     error_msg = re.sub(r"\s+", " ", error_msg).strip()
     return error_msg
+
 
 def _cleanup_partial_files(base_filepath):
     for partial in Path(base_filepath).parent.glob(Path(base_filepath).name + ".*"):
@@ -216,6 +263,7 @@ def _cleanup_partial_files(base_filepath):
             partial.unlink()
         except Exception:
             pass
+
 
 _FORBIDDEN_WORDS = [
     "remix",
@@ -241,6 +289,7 @@ _FORBIDDEN_WORDS = [
     "mashup",
 ]
 
+
 def _slugify(text):
     text = text.lower()
 
@@ -262,6 +311,7 @@ def _slugify(text):
     text = re.sub(r"\s*\[.*?\]\s*", " ", text)
     text = re.sub(r"[^\w\s]", "", text)
     return re.sub(r"\s+", " ", text).strip()
+
 
 def _score_ytmusic_result(result, target_track):
     target_title = target_track.get("name", "Unknown")
@@ -361,6 +411,7 @@ def _score_ytmusic_result(result, target_track):
 
     return total_score
 
+
 def _search_ytmusic(track):
     title = track.get("name", "Unknown")
     artists = track.get("artists", [])
@@ -423,7 +474,26 @@ def _search_ytmusic(track):
 
     return best_url
 
+
 def embed_metadata(filepath, track, fetch_lyrics=False):
+    import time
+
+    for attempt in range(5):
+        try:
+            success = _embed_metadata_inner(filepath, track, fetch_lyrics)
+            if success:
+                return True
+        except PermissionError:
+            if attempt < 4:
+                time.sleep(1.5)
+                continue
+            return False
+        except Exception:
+            return False
+    return False
+
+
+def _embed_metadata_inner(filepath, track, fetch_lyrics=False):
     ext = filepath.suffix.lower()
     name = str(track.get("name", "Unknown"))
     artists = track.get("artists", [])
@@ -435,8 +505,6 @@ def embed_metadata(filepath, track, fetch_lyrics=False):
     )
     track_num = int(track.get("track_number") or 1)
     track_total = int(track.get("tracks_count") or 0)
-    if track_total < track_num:
-        track_total = track_num
     disc_num = int(track.get("disc_number") or 1)
 
     release_date = track.get("release_date")
@@ -474,6 +542,14 @@ def embed_metadata(filepath, track, fetch_lyrics=False):
                 audio["\xa9lyr"] = [str(lyrics)]
             if cover_data:
                 audio["covr"] = [MP4Cover(cover_data, imageformat=MP4Cover.FORMAT_JPEG)]
+
+            if track.get("wiki"):
+                audio["\xa9cmt"] = [str(track.get("wiki"))]
+            if track.get("mbid"):
+                audio["----:com.apple.iTunes:MusicBrainz Track Id"] = [
+                    str(track.get("mbid")).encode("utf-8")
+                ]
+
             audio.save()
             success = True
 
@@ -503,7 +579,10 @@ def embed_metadata(filepath, track, fetch_lyrics=False):
             audio.tags.add(TPE1(encoding=3, text=primary_artist))
             audio.tags.add(TALB(encoding=3, text=album_name))
             audio.tags.add(TPE2(encoding=3, text=album_artist_str))
-            audio.tags.add(TRCK(encoding=3, text=f"{track_num}/{track_total}"))
+            if track_total > 0:
+                audio.tags.add(TRCK(encoding=3, text=f"{track_num}/{track_total}"))
+            else:
+                audio.tags.add(TRCK(encoding=3, text=str(track_num)))
             audio.tags.add(TPOS(encoding=3, text=str(disc_num)))
             if genre:
                 audio.tags.add(TCON(encoding=3, text=genre))
@@ -521,6 +600,22 @@ def embed_metadata(filepath, track, fetch_lyrics=False):
                         data=cover_data,
                     )
                 )
+
+            from mutagen.id3 import COMM, TXXX
+
+            if track.get("wiki"):
+                audio.tags.add(
+                    COMM(encoding=3, lang="eng", desc="", text=[str(track.get("wiki"))])
+                )
+            if track.get("mbid"):
+                audio.tags.add(
+                    TXXX(
+                        encoding=3,
+                        desc="MusicBrainz Track Id",
+                        text=[str(track.get("mbid"))],
+                    )
+                )
+
             audio.save()
             success = True
 
@@ -542,7 +637,8 @@ def embed_metadata(filepath, track, fetch_lyrics=False):
             audio["ALBUM"] = album_name
             audio["ALBUMARTIST"] = album_artist_str
             audio["TRACKNUMBER"] = str(track_num)
-            audio["TRACKTOTAL"] = str(track_total)
+            if track_total > 0:
+                audio["TRACKTOTAL"] = str(track_total)
             audio["DISCNUMBER"] = str(disc_num)
             if genre:
                 audio["GENRE"] = genre
@@ -564,6 +660,12 @@ def embed_metadata(filepath, track, fetch_lyrics=False):
                     audio["metadata_block_picture"] = [
                         base64.b64encode(pic.write()).decode("ascii")
                     ]
+
+            if track.get("wiki"):
+                audio["DESCRIPTION"] = str(track.get("wiki"))
+            if track.get("mbid"):
+                audio["MUSICBRAINZ_TRACKID"] = str(track.get("mbid"))
+
             audio.save()
             success = True
 
@@ -571,21 +673,13 @@ def embed_metadata(filepath, track, fetch_lyrics=False):
             return False
 
         if success:
-            if (
-                track.get("wiki")
-                or track.get("mbid")
-                or (track.get("genres") and len(track.get("genres", [])) > 0)
-            ):
-                embed_lastfm_metadata(
-                    filepath,
-                    track.get("genres", []),
-                    track.get("wiki", ""),
-                    track.get("mbid", ""),
-                )
             return True
 
+    except PermissionError:
+        raise
     except Exception:
         return False
+
 
 def get_zen_profile_path():
     try:
@@ -599,6 +693,7 @@ def get_zen_profile_path():
     except Exception:
         pass
     return None
+
 
 def build_ydl_opts(
     cookies_source=None,
@@ -638,6 +733,7 @@ def build_ydl_opts(
 
     return ydl_opts
 
+
 def download_and_tag(
     track,
     output_dir,
@@ -658,10 +754,11 @@ def download_and_tag(
     filename_template = f"{track_index:02d} - {artist} - {title}"
     base_filepath = Path(output_dir) / filename_template
     final_path_obj = Path(str(base_filepath) + f".{format_flag}")
-    
+
     if final_path_obj.exists():
         if refresh_metadata:
-            embed_metadata(final_path_obj, track, fetch_lyrics)
+            if not embed_metadata(final_path_obj, track, fetch_lyrics):
+                return "error", "Failed to write metadata (file might be locked)"
         return "success", final_path_obj.name
 
     direct_url = track.get("direct_url")
@@ -686,7 +783,18 @@ def download_and_tag(
         yt_logger.last_error = ""
 
         try:
-            download_info = ydl.extract_info(video_url, download=True)
+            import time
+
+            for attempt in range(5):
+                try:
+                    download_info = ydl.extract_info(video_url, download=True)
+                    break
+                except Exception as dl_e:
+                    if "[WinError 32]" in str(dl_e):
+                        if attempt < 4:
+                            time.sleep(1.5)
+                            continue
+                    raise dl_e
 
             final_filepath = None
             if (
@@ -703,7 +811,8 @@ def download_and_tag(
             if final_path_obj.exists():
                 if normalize:
                     _apply_twopass_loudnorm(final_path_obj, format_flag)
-                embed_metadata(final_path_obj, track, fetch_lyrics)
+                if not embed_metadata(final_path_obj, track, fetch_lyrics):
+                    return "error", "Failed to write metadata (file might be locked)"
                 _download_succeeded = True
                 return "success", final_path_obj.name
 
@@ -717,7 +826,13 @@ def download_and_tag(
             ):
                 if fallback:
                     result = _soundcloud_fallback(
-                        track, base_filepath, format_flag, ydl, yt_logger, fetch_lyrics, normalize
+                        track,
+                        base_filepath,
+                        format_flag,
+                        ydl,
+                        yt_logger,
+                        fetch_lyrics,
+                        normalize,
                     )
                     if result[0] in ("fallback_success", "success"):
                         _download_succeeded = True
@@ -751,7 +866,7 @@ def download_and_tag(
                             ydl,
                             yt_logger,
                             fetch_lyrics,
-                            normalize
+                            normalize,
                         )
                         if result[0] in ("fallback_success", "success"):
                             _download_succeeded = True
@@ -765,6 +880,7 @@ def download_and_tag(
     finally:
         if not _download_succeeded:
             _cleanup_partial_files(base_filepath)
+
 
 def _soundcloud_fallback(
     track, base_filepath, format_flag, ydl, yt_logger, fetch_lyrics, normalize=False
@@ -797,7 +913,11 @@ def _soundcloud_fallback(
                 if final_path_obj.exists():
                     if normalize:
                         _apply_twopass_loudnorm(final_path_obj, format_flag)
-                    embed_metadata(final_path_obj, track, fetch_lyrics)
+                    if not embed_metadata(final_path_obj, track, fetch_lyrics):
+                        return (
+                            "error",
+                            "Failed to write metadata (file might be locked)",
+                        )
                     return "fallback_success", final_path_obj.name
     except Exception as e:
         return "error", sanitize_ytdlp_error(str(e))
@@ -806,6 +926,7 @@ def _soundcloud_fallback(
         "drm_blocked",
         "YouTube DRM blocked audio stream (Upstream yt-dlp issue)",
     )
+
 
 def embed_lastfm_metadata(filepath, genres, wiki, mbid):
     import logging
@@ -817,7 +938,7 @@ def embed_lastfm_metadata(filepath, genres, wiki, mbid):
     try:
         genre_str = ", ".join(genres) if genres else None
         ext = filepath.suffix.lower()
-        
+
         if ext == ".m4a":
             audio = MP4(filepath)
             if genre_str:
