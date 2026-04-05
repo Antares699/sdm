@@ -2,18 +2,125 @@ import os
 import re
 import glob
 import yt_dlp
+from math import exp
 from pathlib import Path
 import logging
+import threading
+import json
+import subprocess
 from threading import Lock
-from sdm.metadata import get_itunes_metadata, get_lrclib_lyrics, _session
+from difflib import SequenceMatcher
+from sdm.metadata import get_lrclib_lyrics, _session
 
 logging.getLogger("yt_dlp").setLevel(logging.ERROR)
 
 _cover_cache = {}
-_itunes_cache = {}
 _cache_lock = Lock()
 
 _ffmpeg_path = None
+
+_ytmusic = None
+_ytmusic_lock = Lock()
+
+_thread_local = threading.local()
+
+def _get_ydl(opts, outtmpl, logger):
+    if not hasattr(_thread_local, "ydl"):
+        import copy
+        base_opts = copy.deepcopy(opts)
+        base_opts["outtmpl"] = outtmpl
+        base_opts["logger"] = logger
+        _thread_local.ydl = yt_dlp.YoutubeDL(base_opts)
+    else:
+        if isinstance(_thread_local.ydl.params.get("outtmpl"), dict):
+            _thread_local.ydl.params["outtmpl"]["default"] = outtmpl
+        else:
+            _thread_local.ydl.params["outtmpl"] = outtmpl
+        _thread_local.ydl.params["logger"] = logger
+    return _thread_local.ydl
+
+def _apply_twopass_loudnorm(filepath, format_flag):
+    temp_filepath = filepath.with_suffix(f".temp.{format_flag}")
+    codec = {"m4a": "aac", "mp3": "libmp3lame", "flac": "flac", "opus": "libopus"}.get(format_flag, "aac")
+    
+    cmd1 = [
+        _get_ffmpeg_path(), "-y", "-hide_banner", "-i", str(filepath),
+        "-af", "loudnorm=I=-14:LRA=11:TP=-1.5:print_format=json",
+        "-f", "null", "-"
+    ]
+    try:
+        res = subprocess.run(cmd1, capture_output=True, text=True, check=True)
+        match = re.search(r"\{.*?\}", res.stderr, re.DOTALL)
+        if not match:
+            raise ValueError("No JSON found in Pass 1 output")
+        stats = json.loads(match.group(0))
+        
+        measured_i = stats.get("input_i")
+        measured_lra = stats.get("input_lra")
+        measured_tp = stats.get("input_tp")
+        measured_thresh = stats.get("input_thresh")
+        target_offset = stats.get("target_offset")
+
+        if not all([measured_i, measured_lra, measured_tp, measured_thresh, target_offset]):
+            raise ValueError("Missing values in JSON")
+
+        cmd2 = [
+            _get_ffmpeg_path(), "-y", "-hide_banner", "-i", str(filepath),
+            "-af", f"loudnorm=I=-14:LRA=11:TP=-1.5:measured_I={measured_i}:measured_LRA={measured_lra}:measured_TP={measured_tp}:measured_thresh={measured_thresh}:offset={target_offset}:linear=true",
+            "-c:a", codec
+        ]
+        if format_flag == "mp3":
+            cmd2.extend(["-q:a", "2"])
+        elif format_flag == "m4a":
+            cmd2.extend(["-b:a", "256k"])
+        elif format_flag == "opus":
+            cmd2.extend(["-b:a", "128k"])
+
+        cmd2.extend(["-vn", str(temp_filepath)])
+        subprocess.run(cmd2, capture_output=True, check=True)
+
+        if temp_filepath.exists():
+            temp_filepath.replace(filepath)
+    except Exception:
+        if temp_filepath.exists():
+            try:
+                temp_filepath.unlink()
+            except Exception:
+                pass
+
+        cmd_fallback = [
+            _get_ffmpeg_path(), "-y", "-hide_banner", "-i", str(filepath),
+            "-af", "loudnorm=I=-14:LRA=11:TP=-1.5",
+            "-c:a", codec
+        ]
+        if format_flag == "mp3":
+            cmd_fallback.extend(["-q:a", "2"])
+        elif format_flag == "m4a":
+            cmd_fallback.extend(["-b:a", "256k"])
+        elif format_flag == "opus":
+            cmd_fallback.extend(["-b:a", "128k"])
+        cmd_fallback.extend(["-vn", str(temp_filepath)])
+        
+        try:
+            subprocess.run(cmd_fallback, capture_output=True, check=True)
+            if temp_filepath.exists():
+                temp_filepath.replace(filepath)
+        except Exception:
+            if temp_filepath.exists():
+                try:
+                    temp_filepath.unlink()
+                except Exception:
+                    pass
+
+def _get_ytmusic():
+    global _ytmusic
+    if _ytmusic is None:
+        with _ytmusic_lock:
+            if _ytmusic is None:
+                from ytmusicapi import YTMusic
+
+                _ytmusic = YTMusic()
+    return _ytmusic
 
 def _get_ffmpeg_path():
     global _ffmpeg_path
@@ -29,9 +136,7 @@ def _get_ffmpeg_path():
             _ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
     return _ffmpeg_path
 
-
 def _get_cached_cover(cover_url):
-    """Download cover art with caching. Returns bytes or None."""
     if not cover_url:
         return None
     with _cache_lock:
@@ -44,19 +149,6 @@ def _get_cached_cover(cover_url):
     with _cache_lock:
         _cover_cache[cover_url] = data
     return data
-
-
-def _get_cached_itunes(track_name, artist_name):
-    """Fetch iTunes metadata with caching. Returns (genre, release_date)."""
-    key = (artist_name.lower().strip(), track_name.lower().strip())
-    with _cache_lock:
-        if key in _itunes_cache:
-            return _itunes_cache[key]
-    genre, release_date = get_itunes_metadata(track_name, artist_name)
-    with _cache_lock:
-        _itunes_cache[key] = (genre, release_date)
-    return genre, release_date
-
 
 class YTDLLogger:
     def __init__(self):
@@ -74,11 +166,9 @@ class YTDLLogger:
     def error(self, msg):
         self.last_error = msg
 
-
 def sanitize_filename(name):
     safe_name = str(name or "Unknown")
     return re.sub(r'[\\/*?:"<>|]', "", safe_name).strip()
-
 
 def sanitize_ytdlp_error(error_msg):
     if not error_msg:
@@ -120,42 +210,218 @@ def sanitize_ytdlp_error(error_msg):
     error_msg = re.sub(r"\s+", " ", error_msg).strip()
     return error_msg
 
+def _cleanup_partial_files(base_filepath):
+    for partial in Path(base_filepath).parent.glob(Path(base_filepath).name + ".*"):
+        try:
+            partial.unlink()
+        except Exception:
+            pass
 
-def _score_match(entry, target_title, target_artist, target_duration_ms):
-    """Score a YouTube search result against target track metadata."""
-    from difflib import SequenceMatcher
+_FORBIDDEN_WORDS = [
+    "remix",
+    "live",
+    "cover",
+    "karaoke",
+    "instrumental",
+    "acoustic",
+    "slowed",
+    "reverb",
+    "sped up",
+    "nightcore",
+    "8d audio",
+    "8d",
+    "bass boosted",
+    "bassboosted",
+    "concert",
+    "acapella",
+    "a capella",
+    "reaction",
+    "tutorial",
+    "lesson",
+    "mashup",
+]
 
-    score = 0
+def _slugify(text):
+    text = text.lower()
 
-    entry_duration = entry.get("duration")  # seconds
-    if entry_duration and target_duration_ms:
-        diff_ms = abs(entry_duration * 1000 - target_duration_ms)
-        if diff_ms < 3000:
-            score += 40  
-        elif diff_ms < 10000:
-            score += 25  
-        elif diff_ms < 30000:
-            score += 10  
+    text = re.sub(
+        r"\s*-\s*\d{4}\s*(remaster(ed)?|master|mix|edition|version).*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
 
-    entry_title = (entry.get("title") or "").lower()
-    title_ratio = SequenceMatcher(None, target_title.lower(), entry_title).ratio()
-    score += int(title_ratio * 30)
+    text = re.sub(
+        r"\s*-\s*(remastered|deluxe|anniversary|expanded|bonus track|edit|version"
+        r"|single version|album version|mono|stereo|radio edit|explicit|master).*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"\s*\(.*?\)\s*", " ", text)
+    text = re.sub(r"\s*\[.*?\]\s*", " ", text)
+    text = re.sub(r"[^\w\s]", "", text)
+    return re.sub(r"\s+", " ", text).strip()
 
-    channel = (entry.get("uploader") or entry.get("channel") or "").lower()
-    if target_artist.lower() in channel:
-        score += 20
-    elif SequenceMatcher(None, target_artist.lower(), channel).ratio() > 0.6:
-        score += 10
+def _score_ytmusic_result(result, target_track):
+    target_title = target_track.get("name", "Unknown")
+    target_artists = target_track.get("artists", ["Unknown Artist"])
+    target_artist = target_artists[0] if target_artists else "Unknown"
+    target_duration_ms = target_track.get("duration", 0)
+    target_album = target_track.get("album", "")
+    target_explicit = target_track.get("explicit", False)
 
-    if "official" in entry_title or "audio" in entry_title:
-        score += 10
+    result_title = result.get("title", "")
+    result_artists = [a.get("name", "") for a in result.get("artists", [])]
+    result_artist_str = ", ".join(result_artists).lower()
+    result_duration_s = result.get("duration_seconds") or 0
+    result_album = (
+        result.get("album", {}).get("name", "")
+        if isinstance(result.get("album"), dict)
+        else ""
+    )
+    result_explicit = result.get("isExplicit", False)
 
-    if any(w in entry_title for w in ["remix", "live", "cover", "karaoke"]):
-        if not any(w in target_title.lower() for w in ["remix", "live", "cover"]):
-            score -= 15
+    slug_target = _slugify(target_title)
+    slug_result = _slugify(result_title)
 
-    return score
+    result_lower = result_title.lower()
+    target_lower = target_title.lower()
+    for word in _FORBIDDEN_WORDS:
+        if word in result_lower and word not in target_lower:
+            return -1
 
+    duration_score = 0
+    if result_duration_s and target_duration_ms:
+        target_duration_s = target_duration_ms / 1000
+        diff_s = abs(result_duration_s - target_duration_s)
+
+        if diff_s > 30:
+            return -1
+        if diff_s <= 5:
+            duration_score = 35 - (diff_s * 1)
+        else:
+            duration_score = 30 * exp(-0.15 * (diff_s - 5))
+
+    title_ratio = SequenceMatcher(None, slug_target, slug_result).ratio()
+
+    if slug_target and slug_result:
+        if slug_target in slug_result or slug_result in slug_target:
+            containment_ratio = min(len(slug_target), len(slug_result)) / max(
+                len(slug_target), len(slug_result)
+            )
+            title_ratio = max(title_ratio, containment_ratio, 0.75)
+
+    if title_ratio < 0.5:
+        return -1
+
+    title_score = title_ratio * 35
+
+    artist_score = 0
+    best_artist_ratio = 0
+
+    for ta in target_artists:
+        slug_ta = _slugify(ta)
+        for ra in result_artists:
+            ratio = SequenceMatcher(None, slug_ta, _slugify(ra)).ratio()
+            best_artist_ratio = max(best_artist_ratio, ratio)
+
+    slug_primary_target = _slugify(target_artist)
+    if slug_primary_target in result_artist_str or any(
+        _slugify(ra) in slug_primary_target for ra in result_artists
+    ):
+        best_artist_ratio = max(best_artist_ratio, 0.85)
+
+    if best_artist_ratio < 0.4 and slug_primary_target:
+        slug_result_title_lower = slug_result if slug_result else _slugify(result_title)
+        artist_words = slug_primary_target.split()
+        significant_words = [w for w in artist_words if len(w) > 2]
+        if significant_words:
+            matches = sum(1 for w in significant_words if w in slug_result_title_lower)
+            if matches >= len(significant_words) * 0.5:
+                best_artist_ratio = max(best_artist_ratio, 0.7)
+
+    if best_artist_ratio < 0.4:
+        return -1
+
+    artist_score = best_artist_ratio * 30
+
+    total_score = int(duration_score + title_score + artist_score)
+
+    if target_album and result_album:
+        if _slugify(target_album) == _slugify(result_album):
+            total_score += 15
+        elif _slugify(target_album) in _slugify(result_album) or _slugify(
+            result_album
+        ) in _slugify(target_album):
+            total_score += 5
+
+    if target_explicit != result_explicit:
+        total_score -= 20
+
+    return total_score
+
+def _search_ytmusic(track):
+    title = track.get("name", "Unknown")
+    artists = track.get("artists", [])
+    artist = artists[0] if artists else "Unknown"
+
+    all_artists = (
+        ", ".join(str(a) for a in artists) if len(artists) > 1 else str(artist)
+    )
+    search_query = f"{all_artists} - {title}"
+
+    ytm = _get_ytmusic()
+    best_url = None
+    best_score = -1
+
+    try:
+        song_results = ytm.search(search_query, filter="songs", limit=10)
+    except Exception:
+        song_results = []
+
+    for r in song_results:
+        score = _score_ytmusic_result(r, track)
+        if score > best_score:
+            best_score = score
+            video_id = r.get("videoId")
+            if video_id:
+                best_url = f"https://music.youtube.com/watch?v={video_id}"
+
+        if best_score >= 95:
+            return best_url
+
+    try:
+        video_results = ytm.search(search_query, filter="videos", limit=10)
+    except Exception:
+        video_results = []
+
+    for r in video_results:
+        score = _score_ytmusic_result(r, track)
+        if score > best_score:
+            best_score = score
+            video_id = r.get("videoId")
+            if video_id:
+                best_url = f"https://www.youtube.com/watch?v={video_id}"
+
+    if best_score < 70:
+        fallback_query = f"{title} {artist}"
+        try:
+            fallback_results = ytm.search(fallback_query, filter="songs", limit=5)
+            for r in fallback_results:
+                score = _score_ytmusic_result(r, track)
+                if score > best_score:
+                    best_score = score
+                    video_id = r.get("videoId")
+                    if video_id:
+                        best_url = f"https://music.youtube.com/watch?v={video_id}"
+        except Exception:
+            pass
+
+    if best_score < 30:
+        return None
+
+    return best_url
 
 def embed_metadata(filepath, track, fetch_lyrics=False):
     ext = filepath.suffix.lower()
@@ -168,10 +434,15 @@ def embed_metadata(filepath, track, fetch_lyrics=False):
         ", ".join(str(a) for a in album_artists) if album_artists else primary_artist
     )
     track_num = int(track.get("track_number") or 1)
-    track_total = int(track.get("tracks_count") or track_num)
+    track_total = int(track.get("tracks_count") or 0)
+    if track_total < track_num:
+        track_total = track_num
     disc_num = int(track.get("disc_number") or 1)
 
-    genre, release_date = _get_cached_itunes(name, primary_artist)
+    release_date = track.get("release_date")
+    genres = track.get("genres", [])
+    genre = ", ".join(g.title() for g in genres) if genres else None
+
     lyrics = ""
     if fetch_lyrics:
         lyrics = get_lrclib_lyrics(
@@ -181,14 +452,13 @@ def embed_metadata(filepath, track, fetch_lyrics=False):
     cover_data = _get_cached_cover(track.get("cover_url"))
 
     try:
+        success = False
         if ext == ".m4a":
             from mutagen.mp4 import MP4, MP4Cover
 
             audio = MP4(filepath)
             audio["\xa9nam"] = [name]
             audio["\xa9ART"] = [primary_artist]
-            if len(artists) > 1:
-                audio["aART"] = [", ".join(str(a) for a in artists)]
             audio["\xa9alb"] = [album_name]
             if album_artists:
                 audio["aART"] = [album_artist_str]
@@ -205,7 +475,7 @@ def embed_metadata(filepath, track, fetch_lyrics=False):
             if cover_data:
                 audio["covr"] = [MP4Cover(cover_data, imageformat=MP4Cover.FORMAT_JPEG)]
             audio.save()
-            return True
+            success = True
 
         elif ext == ".mp3":
             from mutagen.mp3 import MP3
@@ -234,7 +504,7 @@ def embed_metadata(filepath, track, fetch_lyrics=False):
             audio.tags.add(TALB(encoding=3, text=album_name))
             audio.tags.add(TPE2(encoding=3, text=album_artist_str))
             audio.tags.add(TRCK(encoding=3, text=f"{track_num}/{track_total}"))
-            audio.tags.add(TPOS(encoding=3, text=f"{disc_num}/1"))
+            audio.tags.add(TPOS(encoding=3, text=str(disc_num)))
             if genre:
                 audio.tags.add(TCON(encoding=3, text=genre))
             if release_date:
@@ -252,7 +522,7 @@ def embed_metadata(filepath, track, fetch_lyrics=False):
                     )
                 )
             audio.save()
-            return True
+            success = True
 
         elif ext in [".flac", ".opus"]:
             from mutagen.flac import Picture
@@ -295,14 +565,27 @@ def embed_metadata(filepath, track, fetch_lyrics=False):
                         base64.b64encode(pic.write()).decode("ascii")
                     ]
             audio.save()
-            return True
+            success = True
 
         else:
             return False
 
+        if success:
+            if (
+                track.get("wiki")
+                or track.get("mbid")
+                or (track.get("genres") and len(track.get("genres", [])) > 0)
+            ):
+                embed_lastfm_metadata(
+                    filepath,
+                    track.get("genres", []),
+                    track.get("wiki", ""),
+                    track.get("mbid", ""),
+                )
+            return True
+
     except Exception:
         return False
-
 
 def get_zen_profile_path():
     try:
@@ -317,14 +600,12 @@ def get_zen_profile_path():
         pass
     return None
 
-
 def build_ydl_opts(
     cookies_source=None,
     format_flag="m4a",
     sponsor_block=False,
     normalize=False,
 ):
-    """Build YoutubeDL options shared across all tracks in a batch."""
     postprocessors = [{"key": "FFmpegExtractAudio", "preferredcodec": format_flag}]
 
     ydl_opts = {
@@ -335,13 +616,7 @@ def build_ydl_opts(
         "no_warnings": True,
         "nocheckcertificate": True,
         "geo_bypass": True,
-        "extract_flat": "in_playlist",
     }
-
-    if normalize:
-        ydl_opts["postprocessor_args"] = {
-            "ffmpeg": ["-af", "loudnorm=I=-14:LRA=11:TP=-1.5"]
-        }
 
     if sponsor_block:
         ydl_opts["sponsorblock_remove"] = [
@@ -363,7 +638,6 @@ def build_ydl_opts(
 
     return ydl_opts
 
-
 def download_and_tag(
     track,
     output_dir,
@@ -374,7 +648,8 @@ def download_and_tag(
     sponsor_block=False,
     normalize=False,
     fetch_lyrics=False,
-    ydl=None,
+    ydl_opts=None,
+    refresh_metadata=False,
 ):
     title = sanitize_filename(track.get("name"))
     artists = track.get("artists", [])
@@ -382,59 +657,131 @@ def download_and_tag(
 
     filename_template = f"{track_index:02d} - {artist} - {title}"
     base_filepath = Path(output_dir) / filename_template
+    final_path_obj = Path(str(base_filepath) + f".{format_flag}")
+    
+    if final_path_obj.exists():
+        if refresh_metadata:
+            embed_metadata(final_path_obj, track, fetch_lyrics)
+        return "success", final_path_obj.name
 
     direct_url = track.get("direct_url")
-    search_query = f"{artist} - {title} audio"
     yt_logger = YTDLLogger()
 
-    own_ydl = False
-    if ydl is not None:
-        ydl.params["outtmpl"]["default"] = str(base_filepath) + ".%(ext)s"
-        ydl.params["logger"] = yt_logger
+    if ydl_opts is not None:
+        opts = ydl_opts
     else:
-        own_ydl = True
-        ydl_opts = build_ydl_opts(cookies_source, format_flag, sponsor_block, normalize)
-        ydl_opts["outtmpl"] = str(base_filepath) + ".%(ext)s"
-        ydl_opts["logger"] = yt_logger
-        ydl = yt_dlp.YoutubeDL(ydl_opts)
+        opts = build_ydl_opts(cookies_source, format_flag, sponsor_block, False)
 
-    last_error_message = "No search results found"
+    ydl = _get_ydl(opts, str(base_filepath) + ".%(ext)s", yt_logger)
 
+    _download_succeeded = False
     try:
+        if direct_url:
+            video_url = direct_url
+        else:
+            video_url = _search_ytmusic(track)
+            if not video_url:
+                return "error", "No confident match found on YouTube Music"
+
+        yt_logger.last_error = ""
+
         try:
-            if direct_url:
-                info = {"entries": [{"url": direct_url}]}
+            download_info = ydl.extract_info(video_url, download=True)
+
+            final_filepath = None
+            if (
+                "requested_downloads" in download_info
+                and download_info["requested_downloads"]
+            ):
+                final_filepath = download_info["requested_downloads"][0].get("filepath")
+
+            if not final_filepath:
+                final_filepath = str(base_filepath) + f".{format_flag}"
+
+            final_path_obj = Path(final_filepath)
+
+            if final_path_obj.exists():
+                if normalize:
+                    _apply_twopass_loudnorm(final_path_obj, format_flag)
+                embed_metadata(final_path_obj, track, fetch_lyrics)
+                _download_succeeded = True
+                return "success", final_path_obj.name
+
+            return "error", "Downloaded file not found"
+
+        except yt_dlp.utils.DownloadError as e:
+            error_msg = str(e)
+            if (
+                "Sign in to confirm your age" in error_msg
+                or "Sign in to confirm your age" in yt_logger.last_error
+            ):
+                if fallback:
+                    result = _soundcloud_fallback(
+                        track, base_filepath, format_flag, ydl, yt_logger, fetch_lyrics, normalize
+                    )
+                    if result[0] in ("fallback_success", "success"):
+                        _download_succeeded = True
+                    return result
+                return (
+                    "drm_blocked",
+                    "YouTube DRM blocked audio stream (Upstream yt-dlp issue)",
+                )
+            elif (
+                "DPAPI" in error_msg
+                or "decrypt" in error_msg
+                or "DPAPI" in yt_logger.last_error
+                or "decrypt" in yt_logger.last_error
+            ):
+                return "encryption_error", "Browser cookies are encrypted"
+            elif (
+                "locked" in error_msg.lower()
+                or "locked" in yt_logger.last_error.lower()
+            ):
+                return "error", "Cookie database is locked. Close your browser."
             else:
-                info = ydl.extract_info(f"ytsearch3:{search_query}", download=False)
+                clean = yt_logger.last_error if yt_logger.last_error else error_msg
+                clean = sanitize_ytdlp_error(clean)
+
+                if "DRM" in clean or "Age restricted" in clean:
+                    if fallback:
+                        result = _soundcloud_fallback(
+                            track,
+                            base_filepath,
+                            format_flag,
+                            ydl,
+                            yt_logger,
+                            fetch_lyrics,
+                            normalize
+                        )
+                        if result[0] in ("fallback_success", "success"):
+                            _download_succeeded = True
+                        return result
+                    return "drm_blocked", clean
+
+                return "error", clean
+
         except Exception as e:
             return "error", sanitize_ytdlp_error(str(e))
+    finally:
+        if not _download_succeeded:
+            _cleanup_partial_files(base_filepath)
 
-        if not info or "entries" not in info or not info["entries"]:
-            return "error", "No search results found"
+def _soundcloud_fallback(
+    track, base_filepath, format_flag, ydl, yt_logger, fetch_lyrics, normalize=False
+):
+    title = track.get("name", "Unknown")
+    artists = track.get("artists", [])
+    artist = artists[0] if artists else "Unknown"
+    search_query = f"{artist} {title}"
 
-        entries = [e for e in info["entries"] if e]
-        target_duration = track.get("duration")
-        if not direct_url and target_duration:
-            scored = [
-                (e, _score_match(e, title, artist, target_duration)) for e in entries
-            ]
-            scored.sort(key=lambda x: x[1], reverse=True)
-            entries = [e for e, s in scored]
-
-        for entry in entries:
-            if not entry:
-                continue
-
-            video_url = entry.get("url") or entry.get("webpage_url")
-            if not video_url:
-                continue
-
-            yt_logger.last_error = ""
-
-            try:
-                # Attempt to download the specific video
-                download_info = ydl.extract_info(video_url, download=True)
-
+    yt_logger.last_error = ""
+    try:
+        sc_info = ydl.extract_info(f"scsearch1:{search_query}", download=False)
+        if sc_info and "entries" in sc_info and sc_info["entries"]:
+            sc_entry = sc_info["entries"][0]
+            sc_url = sc_entry.get("url")
+            if sc_url:
+                download_info = ydl.extract_info(sc_url, download=True)
                 final_filepath = None
                 if (
                     "requested_downloads" in download_info
@@ -443,93 +790,77 @@ def download_and_tag(
                     final_filepath = download_info["requested_downloads"][0].get(
                         "filepath"
                     )
-
                 if not final_filepath:
                     final_filepath = str(base_filepath) + f".{format_flag}"
 
                 final_path_obj = Path(final_filepath)
-
                 if final_path_obj.exists():
+                    if normalize:
+                        _apply_twopass_loudnorm(final_path_obj, format_flag)
                     embed_metadata(final_path_obj, track, fetch_lyrics)
-                    return "success", final_path_obj.name
-
-            except yt_dlp.utils.DownloadError as e:
-                error_msg = str(e)
-                if (
-                    "Sign in to confirm your age" in error_msg
-                    or "Sign in to confirm your age" in yt_logger.last_error
-                ):
-                    last_error_message = "Age restricted content"
-                elif (
-                    "DPAPI" in error_msg
-                    or "decrypt" in error_msg
-                    or "DPAPI" in yt_logger.last_error
-                    or "decrypt" in yt_logger.last_error
-                ):
-                    return "encryption_error", "Browser cookies are encrypted"
-                elif (
-                    "locked" in error_msg.lower()
-                    or "locked" in yt_logger.last_error.lower()
-                ):
-                    return "error", "Cookie database is locked. Close your browser."
-                else:
-                    clean_error = (
-                        yt_logger.last_error if yt_logger.last_error else error_msg
-                    )
-                    last_error_message = sanitize_ytdlp_error(clean_error)
-                continue
-
-            except Exception as e:
-                last_error_message = sanitize_ytdlp_error(str(e))
-                continue
-
-        # If we exhausted all 3 entries and none worked
-        is_drm_blocked = (
-            "YouTube DRM blocked audio stream" in last_error_message
-            or "Age restricted" in last_error_message
-        )
-
-        if fallback and is_drm_blocked:
-            yt_logger.last_error = ""
-            try:
-                sc_info = ydl.extract_info(f"scsearch1:{search_query}", download=False)
-                if sc_info and "entries" in sc_info and sc_info["entries"]:
-                    sc_entry = sc_info["entries"][0]
-                    sc_url = sc_entry.get("url")
-                    if sc_url:
-                        download_info = ydl.extract_info(sc_url, download=True)
-                        final_filepath = None
-                        if (
-                            "requested_downloads" in download_info
-                            and download_info["requested_downloads"]
-                        ):
-                            final_filepath = download_info["requested_downloads"][
-                                0
-                            ].get("filepath")
-                        if not final_filepath:
-                            final_filepath = str(base_filepath) + f".{format_flag}"
-
-                        final_path_obj = Path(final_filepath)
-                        if final_path_obj.exists():
-                            embed_metadata(final_path_obj, track, fetch_lyrics)
-                            return "fallback_success", final_path_obj.name
-            except Exception as e:
-                last_error_message = sanitize_ytdlp_error(str(e))
-        elif is_drm_blocked:
-            return (
-                "drm_blocked",
-                "YouTube DRM blocked audio stream (Upstream yt-dlp issue)",
-            )
-
-        if last_error_message == "Age restricted content":
-            return "age_restricted", "All 3 search results were age restricted"
-        elif last_error_message == "Browser cookies are encrypted":
-            return "encryption_error", last_error_message
-
-        return "error", f"All 3 search results failed ({last_error_message})"
-
+                    return "fallback_success", final_path_obj.name
     except Exception as e:
         return "error", sanitize_ytdlp_error(str(e))
-    finally:
-        if own_ydl:
-            ydl.close()
+
+    return (
+        "drm_blocked",
+        "YouTube DRM blocked audio stream (Upstream yt-dlp issue)",
+    )
+
+def embed_lastfm_metadata(filepath, genres, wiki, mbid):
+    import logging
+    from mutagen.mp4 import MP4
+    from mutagen.id3 import ID3, TCON, COMM, TXXX
+
+    logger = logging.getLogger(__name__)
+
+    try:
+        genre_str = ", ".join(genres) if genres else None
+        ext = filepath.suffix.lower()
+        
+        if ext == ".m4a":
+            audio = MP4(filepath)
+            if genre_str:
+                audio["©gen"] = [genre_str]
+            if wiki:
+                audio["©cmt"] = [wiki]
+            if mbid:
+                audio["----:com.apple.iTunes:MusicBrainz Track Id"] = [
+                    mbid.encode("utf-8")
+                ]
+            audio.save()
+            return True
+
+        elif ext == ".mp3":
+            try:
+                audio = ID3(filepath)
+            except Exception:
+                audio = ID3()
+            if genre_str:
+                audio.add(TCON(encoding=3, text=[genre_str]))
+            if wiki:
+                audio.add(COMM(encoding=3, lang="eng", desc="", text=[wiki]))
+            if mbid:
+                audio.add(TXXX(encoding=3, desc="MusicBrainz Track Id", text=[mbid]))
+            audio.save(filepath)
+            return True
+
+        elif ext in [".flac", ".opus"]:
+            import mutagen
+
+            audio = mutagen.File(filepath)
+            if not audio:
+                return False
+            if genre_str:
+                audio["genre"] = [genre_str]
+            if wiki:
+                audio["description"] = wiki
+            if mbid:
+                audio["musicbrainz_trackid"] = mbid
+            audio.save()
+            return True
+
+    except Exception as e:
+        logger.error(f"Error embedding Last.fm metadata in {filepath}: {e}")
+        return False
+    return False

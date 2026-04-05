@@ -2,6 +2,7 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import typer
 from enum import Enum
+import typing
 
 from rich.console import Console
 from rich.progress import (
@@ -42,25 +43,39 @@ class AudioFormat(str, Enum):
 
 
 def execute_sync_or_download(
-    url: str,
+    url: typing.Optional[str],
     output_dir: Path,
     format: AudioFormat,
     cleanup: bool,
     dry_run: bool,
     no_delete: bool,
     workers: int,
-    cookies: str,
+    cookies: typing.Optional[str],
     sponsor_block: bool,
     normalize: bool,
     lyrics: bool,
     refresh_metadata: bool,
 ):
-    sync_manager = SyncManager(output_dir)
+    is_static = False
     if url:
-        sync_manager.set_source_url(url)
+        url_str = str(url).lower()
+        if (
+            "/album/" in url_str
+            or "/track/" in url_str
+            or "watch?v=" in url_str
+            or "youtu.be" in url_str
+        ):
+            is_static = True
+        elif "soundcloud.com" in url_str and "/sets/" not in url_str:
+            is_static = True
+
+    sync_manager = SyncManager(output_dir, is_static=is_static)
+    source_url = url
+    if source_url:
+        sync_manager.set_source_url(source_url)
     else:
-        url = sync_manager.get_source_url()
-        if not url:
+        source_url = sync_manager.get_source_url()
+        if not source_url:
             console.print(
                 "[bold red]Error:[/] No source URL found in this directory. Please run `sdm download <url>` once to link it."
             )
@@ -68,10 +83,15 @@ def execute_sync_or_download(
 
     if dry_run:
         no_delete = True
-
-    console.print("[bold green]sdm: Gathering metadata...[/bold green]")
     try:
-        tracks = fetch_tracks(url)
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[bold green]sdm: Gathering metadata...[/bold green]"),
+            transient=True,
+            console=console,
+        ) as progress:
+            progress.add_task("metadata", total=None)
+            tracks = fetch_tracks(source_url)
     except Exception as e:
         console.print(f"[bold red]Error fetching metadata:[/] {e}")
         raise typer.Exit(code=1)
@@ -127,14 +147,9 @@ def execute_sync_or_download(
             f"{action_verb} {len(tracks_to_download)} tracks using {workers} workers..."
         )
 
-        import threading
-        import yt_dlp
-
         shared_ydl_opts = build_ydl_opts(
             cookies, format.value, sponsor_block, normalize
         )
-        worker_ydl_instances = {}
-        _ydl_lock = threading.Lock()
 
         def worker(index, track, is_synced):
             title = track.get("name", "Unknown")
@@ -156,23 +171,18 @@ def execute_sync_or_download(
                 else:
                     return "error", "Failed to refresh metadata"
             else:
-                # Get or create a per-worker ydl instance
-                tid = threading.current_thread().ident
-                with _ydl_lock:
-                    if tid not in worker_ydl_instances:
-                        worker_ydl_instances[tid] = yt_dlp.YoutubeDL(
-                            dict(shared_ydl_opts)
-                        )
-                ydl_instance = worker_ydl_instances[tid]
-
                 return download_and_tag(
                     track,
                     output_dir,
                     index,
+                    cookies_source=cookies,
                     format_flag=format.value,
                     fallback=False,
+                    sponsor_block=sponsor_block,
+                    normalize=normalize,
                     fetch_lyrics=lyrics,
-                    ydl=ydl_instance,
+                    ydl_opts=shared_ydl_opts,
+                    refresh_metadata=refresh_metadata,
                 )
 
         with Progress(
@@ -259,15 +269,7 @@ def execute_sync_or_download(
 
                     progress.advance(main_task)
 
-        # Flush any remaining batched sync data to disk
         sync_manager.flush()
-
-        # Clean up per-worker yt-dlp instances
-        for ydl_inst in worker_ydl_instances.values():
-            try:
-                ydl_inst.close()
-            except Exception:
-                pass
     else:
         console.print("[green]All tracks are already up to date.[/green]")
 
@@ -350,6 +352,7 @@ def execute_sync_or_download(
                             sponsor_block=sponsor_block,
                             normalize=normalize,
                             fetch_lyrics=lyrics,
+                            refresh_metadata=refresh_metadata,
                         )
                         if f_status in ["fallback_success", "success"]:
                             sync_manager.mark_synced(track["id"], f_message)
@@ -373,10 +376,9 @@ def execute_sync_or_download(
                 f'  sdm inject "your_file.mp3" "<track_url>" -o "{output_dir}"'
             )
 
-        # Flush any sync data from DRM fallback downloads
         sync_manager.flush()
 
-    if not dry_run:
+    if not dry_run and not is_static:
         m3u_path = output_dir / "_playlist.m3u"
         try:
             with open(m3u_path, "w", encoding="utf-8") as f:
@@ -385,11 +387,115 @@ def execute_sync_or_download(
                     t_id = t.get("id")
                     fname = sync_manager.get_filename(t_id)
                     if fname:
-                        f.write(f"{fname}\n")
+                        f.write(fname + "\n")
         except Exception as e:
             console.print(f"[yellow]Warning:[/] Failed to generate _playlist.m3u ({e})")
 
     console.print("\n[bold green]Done![/bold green]")
+
+
+@app.command(help="Search and download a single track directly from YouTube Music.")
+def search(
+    query: str = typer.Argument(..., help="Track name to search for"),
+    output: Path = typer.Option(
+        ".", "--output", "-o", help="Output directory", rich_help_panel="Output Options"
+    ),
+    format: AudioFormat = typer.Option(
+        AudioFormat.m4a,
+        "--format",
+        "-f",
+        help="Audio codec to use",
+        rich_help_panel="Output Options",
+    ),
+    lyrics: bool = typer.Option(
+        False,
+        "--lyrics",
+        help="Automatically fetch and embed synced lyrics",
+        rich_help_panel="Metadata & Tags",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Simulate the download [red]without making changes[/red]",
+    ),
+):
+    from ytmusicapi import YTMusic
+
+    console.print(f"[cyan]Searching for '[bold]{query}[/bold]'...[/cyan]")
+    ytmusic = YTMusic()
+    try:
+        results = ytmusic.search(query, filter="songs", limit=10)
+    except Exception as e:
+        console.print(f"[bold red]Search failed:[/] {e}")
+        raise typer.Exit(1)
+
+    if not results:
+        console.print("[yellow]No results found.[/yellow]")
+        raise typer.Exit()
+
+    results = results[:10]
+
+    table = Table(title="Search Results", show_header=True, header_style="bold magenta")
+    table.add_column("#", style="dim", justify="right")
+    table.add_column("Title")
+    table.add_column("Artist")
+    table.add_column("Album")
+    table.add_column("Duration", justify="right")
+
+    for i, r in enumerate(results, start=1):
+        title = r.get("title", "Unknown")
+
+        artists_data = r.get("artists", [])
+        artists = (
+            ", ".join([a["name"] for a in artists_data if "name" in a])
+            if artists_data
+            else "Unknown"
+        )
+
+        album_data = r.get("album")
+        album = album_data.get("name", "Unknown") if album_data else "Unknown"
+
+        duration = r.get("duration", "0:00")
+        table.add_row(str(i), title, artists, album, duration)
+
+    console.print(table)
+
+    from rich.prompt import IntPrompt
+
+    choice = IntPrompt.ask(
+        "Enter the number of the track to download",
+        choices=[str(i) for i in range(len(results) + 1)],
+        show_choices=False,
+        default=0,
+    )
+
+    if choice == 0:
+        console.print("Cancelled.")
+        raise typer.Exit()
+
+    selected = results[choice - 1]
+    vid = selected.get("videoId")
+    if not vid:
+        console.print("[bold red]Selected track has no video ID.[/bold red]")
+        raise typer.Exit(1)
+
+    url = f"https://music.youtube.com/watch?v={vid}"
+
+    output_dir = output.resolve()
+    execute_sync_or_download(
+        url=url,
+        output_dir=output_dir,
+        format=format,
+        cleanup=False,
+        dry_run=dry_run,
+        no_delete=False,
+        workers=1,
+        cookies=None,
+        sponsor_block=False,
+        normalize=False,
+        lyrics=lyrics,
+        refresh_metadata=False,
+    )
 
 
 @app.command(
@@ -466,6 +572,14 @@ def download(
     ),
 ):
     output_dir = output.resolve()
+    kwargs = _merge_config(locals())
+    format = kwargs.get("format", format)
+    workers = kwargs.get("workers", workers)
+    cookies = kwargs.get("cookies", cookies)
+    sponsor_block = kwargs.get("sponsor_block", sponsor_block)
+    normalize = kwargs.get("normalize", normalize)
+    lyrics = kwargs.get("lyrics", lyrics)
+
     execute_sync_or_download(
         url=url,
         output_dir=output_dir,
@@ -545,6 +659,14 @@ def sync(
     ),
 ):
     output_dir = dir.resolve()
+    kwargs = _merge_config(locals())
+    format = kwargs.get("format", format)
+    workers = kwargs.get("workers", workers)
+    cookies = kwargs.get("cookies", cookies)
+    sponsor_block = kwargs.get("sponsor_block", sponsor_block)
+    normalize = kwargs.get("normalize", normalize)
+    lyrics = kwargs.get("lyrics", lyrics)
+
     execute_sync_or_download(
         url=None,
         output_dir=output_dir,
@@ -638,7 +760,6 @@ def inject(
 
         import subprocess
 
-        # Use the shared cached ffmpeg path (with system PATH detection)
         cmd = [_get_ffmpeg_path(), "-y", "-i", str(file)]
 
         codec = {"m4a": "aac", "mp3": "libmp3lame", "flac": "flac", "opus": "libopus"}[
@@ -652,9 +773,6 @@ def inject(
             cmd.extend(["-b:a", "256k"])
         elif format.value == "opus":
             cmd.extend(["-b:a", "128k"])
-
-        if normalize:
-            cmd.extend(["-af", "loudnorm=I=-14:LRA=11:TP=-1.5"])
 
         cmd.extend(["-vn", str(final_filepath)])
 
@@ -671,6 +789,12 @@ def inject(
             console.print("[bold red]Error:[/] ffmpeg failed to process the file.")
             raise typer.Exit(code=1)
 
+        if normalize:
+            console.print("[cyan]Applying 2-pass normalization...[/cyan]")
+            from sdm.download import _apply_twopass_loudnorm
+
+            _apply_twopass_loudnorm(final_filepath, format.value)
+
         console.print("[cyan]Embedding metadata...[/cyan]")
         if embed_metadata(final_filepath, track, fetch_lyrics=lyrics):
             sync_manager.mark_injected(track["id"], final_filepath.name)
@@ -684,6 +808,369 @@ def inject(
     except Exception as e:
         console.print(f"[bold red]Error during injection:[/] {e}")
         raise typer.Exit(code=1)
+
+
+import json
+from rich.table import Table
+
+CONFIG_FILE = Path.home() / ".sdm_config.json"
+
+
+def load_config():
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def save_config(data):
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4)
+
+
+def _merge_config(kwargs):
+    cfg = load_config()
+    if kwargs.get("format") == AudioFormat.m4a and "format" in cfg:
+        try:
+            kwargs["format"] = AudioFormat(cfg["format"])
+        except:
+            pass
+    if kwargs.get("workers") == 3 and "workers" in cfg:
+        kwargs["workers"] = cfg["workers"]
+    if kwargs.get("cookies") is None and "cookies" in cfg:
+        kwargs["cookies"] = cfg["cookies"]
+    if kwargs.get("sponsor_block") is False and "sponsor_block" in cfg:
+        kwargs["sponsor_block"] = cfg["sponsor_block"]
+    if kwargs.get("normalize") is False and "normalize" in cfg:
+        kwargs["normalize"] = cfg["normalize"]
+    if kwargs.get("lyrics") is False and "lyrics" in cfg:
+        kwargs["lyrics"] = cfg["lyrics"]
+    return kwargs
+
+
+@app.command(help="Save default settings for download and sync.")
+def config(
+    format: str = typer.Option(
+        None, "--format", "-f", help="Default audio format (m4a, mp3, flac, opus)"
+    ),
+    workers: int = typer.Option(
+        None, "--workers", "-w", help="Default number of workers"
+    ),
+    cookies: str = typer.Option(
+        None, "--cookies", "-c", help="Browser for cookies (e.g., firefox)"
+    ),
+    sponsor_block: bool = typer.Option(
+        None, "--sponsor-block", help="Use SponsorBlock"
+    ),
+    normalize: bool = typer.Option(
+        None, "--normalize", help="Apply audio normalization"
+    ),
+    lyrics: bool = typer.Option(None, "--lyrics", help="Fetch lyrics"),
+    lastfm_key: str = typer.Option(
+        None, "--lastfm-key", help="Last.fm API Key for extensive metadata"
+    ),
+    clear: bool = typer.Option(False, "--clear", help="Clear all saved configurations"),
+):
+    if clear:
+        if CONFIG_FILE.exists():
+            CONFIG_FILE.unlink()
+        console.print("[bold green]Configuration cleared.[/bold green]")
+        raise typer.Exit()
+
+    cfg = load_config()
+    updated = False
+
+    if format is not None:
+        cfg["format"] = format
+        updated = True
+    if workers is not None:
+        cfg["workers"] = workers
+        updated = True
+    if cookies is not None:
+        cfg["cookies"] = cookies
+        updated = True
+    if sponsor_block is not None:
+        cfg["sponsor_block"] = sponsor_block
+        updated = True
+    if normalize is not None:
+        cfg["normalize"] = normalize
+        updated = True
+    if lyrics is not None:
+        cfg["lyrics"] = lyrics
+        updated = True
+    if lastfm_key is not None:
+        cfg["lastfm_key"] = lastfm_key
+        updated = True
+
+    if updated:
+        save_config(cfg)
+        console.print(f"[bold green]Configuration saved to {CONFIG_FILE}[/bold green]")
+
+    table = Table(
+        title="Current Configuration", show_header=True, header_style="bold magenta"
+    )
+    table.add_column("Key")
+    table.add_column("Value")
+    for k, v in load_config().items():
+        table.add_row(str(k), str(v))
+    console.print(table)
+
+
+@app.command(
+    help="Recursively scan a directory and enrich existing files with Last.fm metadata."
+)
+def tag(
+    dir: Path = typer.Argument(..., help="Directory to tag"),
+):
+    cfg = load_config()
+    lastfm_key = cfg.get("lastfm_key")
+    if not lastfm_key:
+        console.print(
+            "[bold red]Error:[/] Last.fm API key not configured. Please run `sdm config --lastfm-key YOUR_KEY` first."
+        )
+        raise typer.Exit(1)
+
+    output_dir = dir.resolve()
+    audio_files = []
+    for ext in ["*.m4a", "*.mp3", "*.flac", "*.opus"]:
+        audio_files.extend(output_dir.rglob(ext))
+
+    if not audio_files:
+        console.print(f"[yellow]No audio files found in {output_dir}.[/yellow]")
+        raise typer.Exit()
+
+    console.print(
+        f"[bold cyan]Found {len(audio_files)} audio files. Fetching Last.fm metadata...[/bold cyan]"
+    )
+
+    from sdm.metadata import get_lastfm_metadata
+    from sdm.download import embed_lastfm_metadata
+    import mutagen
+    import re
+
+    def get_tags(filepath):
+        try:
+            audio = mutagen.File(filepath)
+            if not audio:
+                return None, None
+            ext = filepath.suffix.lower()
+            if ext == ".m4a":
+                return audio.get("\xa9ART", [""])[0], audio.get("\xa9nam", [""])[0]
+            elif ext == ".mp3":
+                return str(audio.get("TPE1", "")), str(audio.get("TIT2", ""))
+            elif ext in [".flac", ".opus"]:
+                return audio.get("artist", [""])[0], audio.get("title", [""])[0]
+        except Exception:
+            return None, None
+        return None, None
+
+    def process_file(filepath):
+        artist, title = get_tags(filepath)
+        if not artist or not title:
+            return "skipped", filepath.name
+
+        clean_title = re.sub(
+            r"[\(\[].*?(feat|ft|remaster|radio|edit|mix).*?[\)\]]",
+            "",
+            title,
+            flags=re.I,
+        ).strip()
+
+        genres, wiki, mbid = get_lastfm_metadata(artist, clean_title, lastfm_key)
+        if genres or wiki or mbid:
+            if embed_lastfm_metadata(filepath, genres, wiki, mbid):
+                return "success", f"{artist} - {title}"
+        return "not_found", f"{artist} - {title}"
+
+    success_count = 0
+    skipped_count = 0
+    not_found_count = 0
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        "[progress.percentage]{task.percentage:>3.0f}%",
+        TimeRemainingColumn(),
+        console=console,
+    ) as progress:
+        task = progress.add_task(
+            "[bold cyan]Tagging library...", total=len(audio_files)
+        )
+
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            future_to_file = {executor.submit(process_file, f): f for f in audio_files}
+            for future in as_completed(future_to_file):
+                status, name = future.result()
+                if status == "success":
+                    success_count += 1
+                    progress.console.print(f"[green][+][/green] Enriched: {name}")
+                elif status == "skipped":
+                    skipped_count += 1
+                    progress.console.print(
+                        f"[yellow][~][/yellow] Skipped (No Artist/Title): {name}"
+                    )
+                else:
+                    not_found_count += 1
+                    progress.console.print(
+                        f"[yellow][-][/yellow] No Last.fm data: {name}"
+                    )
+                progress.advance(task)
+
+    console.print(
+        f"\n[bold green]Finished tagging {success_count} files![/bold green] (Not Found: {not_found_count}, Skipped: {skipped_count})"
+    )
+
+
+@app.command(help="Show statistics for the local library.")
+def stats(
+    dir: Path = typer.Argument(".", help="Directory to check"),
+):
+    output_dir = dir.resolve()
+    sync_manager = SyncManager(output_dir)
+
+    rows = sync_manager.conn.execute("SELECT track_id, filename FROM tracks").fetchall()
+    injected_rows = sync_manager.conn.execute(
+        "SELECT track_id FROM injected"
+    ).fetchall()
+    injected_ids = {r[0] for r in injected_rows}
+
+    source_url = sync_manager.get_source_url()
+
+    total_tracks = len(rows)
+    total_injected = len(injected_ids)
+
+    total_size = 0
+    formats = {}
+    missing = 0
+
+    for _, filename in rows:
+        filepath = output_dir / filename
+        if filepath.exists():
+            total_size += filepath.stat().st_size
+            ext = filepath.suffix.lower()
+            formats[ext] = formats.get(ext, 0) + 1
+        else:
+            missing += 1
+
+    size_mb = total_size / (1024 * 1024)
+
+    table = Table(
+        title=f"Library Statistics: {output_dir.name}",
+        show_header=True,
+        header_style="bold magenta",
+    )
+    table.add_column("Metric", style="cyan")
+    table.add_column("Value", style="green")
+
+    table.add_row("Source URL", source_url or "None")
+    table.add_row("Total Tracks", str(total_tracks))
+    table.add_row("Injected Files", str(total_injected))
+    table.add_row("Total Size", f"{size_mb:.2f} MB")
+
+    format_str = ", ".join(f"{ext}: {count}" for ext, count in formats.items())
+    table.add_row("Formats", format_str or "None")
+
+    if missing > 0:
+        table.add_row("Missing Files", str(missing), style="red")
+
+    console.print(table)
+
+
+@app.command(help="Bulk convert a downloaded library to a different audio format.")
+def migrate(
+    dir: Path = typer.Option(..., "--dir", help="Target directory"),
+    target_format: AudioFormat = typer.Argument(
+        ..., help="Target audio format (m4a, mp3, flac, opus)"
+    ),
+):
+    output_dir = dir.resolve()
+    sync_manager = SyncManager(output_dir)
+
+    rows = sync_manager.conn.execute("SELECT track_id, filename FROM tracks").fetchall()
+    if not rows:
+        console.print("[yellow]No tracked files found in directory.[/yellow]")
+        raise typer.Exit()
+
+    console.print(
+        f"[bold cyan]Migrating {len(rows)} files to {target_format.value}...[/bold cyan]"
+    )
+    import subprocess
+
+    migrated_count = 0
+    error_count = 0
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        "[progress.percentage]{task.percentage:>3.0f}%",
+        TimeRemainingColumn(),
+        console=console,
+    ) as progress:
+        task = progress.add_task("[bold cyan]Migrating...", total=len(rows))
+
+        for track_id, filename in rows:
+            filepath = output_dir / filename
+            if (
+                not filepath.exists()
+                or filepath.suffix.lower() == f".{target_format.value}"
+            ):
+                progress.advance(task)
+                continue
+
+            new_filename = filepath.with_suffix(f".{target_format.value}").name
+            new_filepath = output_dir / new_filename
+
+            cmd = [_get_ffmpeg_path(), "-y", "-i", str(filepath)]
+            codec = {
+                "m4a": "aac",
+                "mp3": "libmp3lame",
+                "flac": "flac",
+                "opus": "libopus",
+            }[target_format.value]
+            cmd.extend(["-c:a", codec])
+
+            if target_format.value == "mp3":
+                cmd.extend(["-q:a", "2"])
+            elif target_format.value == "m4a":
+                cmd.extend(["-b:a", "256k"])
+            elif target_format.value == "opus":
+                cmd.extend(["-b:a", "128k"])
+
+            cmd.extend(["-vn", str(new_filepath)])
+
+            try:
+                subprocess.run(
+                    cmd,
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+
+                sync_manager.conn.execute(
+                    "UPDATE tracks SET filename = ? WHERE track_id = ?",
+                    (new_filename, track_id),
+                )
+                sync_manager.conn.commit()
+
+                filepath.unlink()
+                migrated_count += 1
+                progress.console.print(f"[green][+][/green] Migrated: {new_filename}")
+            except Exception as e:
+                error_count += 1
+                progress.console.print(
+                    f"[red][-][/red] Failed to migrate {filename}: {e}"
+                )
+
+            progress.advance(task)
+
+    console.print(
+        f"\n[bold green]Migration complete! Migrated {migrated_count} files.[/bold green] (Errors: {error_count})"
+    )
 
 
 def main():

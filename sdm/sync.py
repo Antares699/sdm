@@ -3,14 +3,21 @@ import sqlite3
 from pathlib import Path
 
 class SyncManager:
-    def __init__(self, output_dir):
+    def __init__(self, output_dir, is_static=False):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.db_path = self.output_dir / ".sync.db"
+        self.is_static = is_static
+
+        if is_static:
+            self.db_path = ":memory:"
+        else:
+            self.db_path = self.output_dir / ".sync.db"
+
         self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self.conn.execute("PRAGMA journal_mode=WAL")
         self._create_tables()
-        self._migrate_from_json()
+        if not is_static:
+            self._migrate_from_json()
 
     def _create_tables(self):
         self.conn.executescript("""
@@ -29,7 +36,6 @@ class SyncManager:
         self.conn.commit()
 
     def _migrate_from_json(self):
-        """Auto-migrate from legacy .sync.json to SQLite."""
         json_path = self.output_dir / ".sync.json"
         if not json_path.exists():
             return
@@ -48,7 +54,6 @@ class SyncManager:
                 source_url = None
                 index_map = {}
 
-            # Bulk insert into SQLite
             with self.conn:
                 self.conn.executemany(
                     "INSERT OR IGNORE INTO tracks (track_id, filename) VALUES (?, ?)",
@@ -69,7 +74,6 @@ class SyncManager:
                         ("index_map", json.dumps(index_map)),
                     )
 
-            # Rename old file so it's not migrated again
             backup_path = self.output_dir / ".sync.json.bak"
             json_path.rename(backup_path)
         except Exception:
@@ -141,7 +145,6 @@ class SyncManager:
         return None
 
     def get_filename(self, track_id):
-        """Get the filename for a synced track."""
         row = self.conn.execute(
             "SELECT filename FROM tracks WHERE track_id = ?", (track_id,)
         ).fetchone()

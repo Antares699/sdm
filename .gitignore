@@ -10,3 +10,7 @@ sdm.egg-info/
 *.lrc
 .pytest_cache/
 .DS_Store
+
+*.db
+*.db-shm
+*.db-wal
