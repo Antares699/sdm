@@ -13,7 +13,7 @@ Recently, Spotify restricted their Web API, requiring developers to have a Premi
 - **Universal Support:** Spotify, Apple Music, Tidal, YouTube, and SoundCloud.
 - **Smart Syncing:** Two-way mirroring. Run `sdm sync` to fetch new tracks and clean up removed ones.
 - **Multi-Format:** Download in M4A (default), MP3, FLAC, or OPUS with native tags.
-- **Perfect Metadata:** Embeds Track, Artist, Album, Cover Art, Track/Disc Numbers, Genre, and Release Year.
+- **Perfect Metadata:** Embeds Track, Artist, Album, Cover Art, Track/Disc Numbers, Genre, Release Year, and automatically generates `.m3u8` playlists.
 - **Advanced Processing:** Synced lyrics via LRCLIB, custom 2-pass EBU R128 (-14 LUFS) audio normalization algorithm for perfectly balanced studio-grade levels without dynamic range compression artifacts, and SponsorBlock trimming.
 
 ## Installation
@@ -100,13 +100,15 @@ sdm sync "C:\Users\You\Music\My Playlist"
 To import a local audio file into your playlist with official metadata and protect it from future sync deletions, run
 
 ```bash
-sdm inject [filePath] [trackUrl]
+sdm inject [filePath] [trackUrl (Optional)]
 ```
+
+If the `trackUrl` is omitted, `sdm` will launch an interactive search menu to help you find and apply metadata (including Last.fm enrichment and high-resolution cover art).
 
 Example:
 
 ```bash
-sdm inject "C:\Users\You\Downloads\song.mp3" https://open.spotify.com/track/0VjIjW4GlUZAMYd2vXMi3b
+sdm inject "C:\Users\You\Downloads\song.mp3"
 ```
 
 ### Config
@@ -147,30 +149,32 @@ sdm search "Never Gonna Give You Up - Rick Astley"
 
 ### Stats
 
-To show statistics for your local library (such as track count, total size, and format distribution), run
+To show comprehensive statistics for your local library (such as track count, total size, format distribution, Top Genres, Top Artists, and Decades), run
 
 ```bash
 sdm stats [directory]
 ```
 
+This command also runs a Health Check, warning you if any files are missing cover art or have a bitrate below 128kbps. Add the `-v` or `--verbose` flag to print a detailed list of problematic files.
+
 Example:
 
 ```bash
-sdm stats "C:\Users\You\Music"
+sdm stats "C:\Users\You\Music" -v
 ```
 
 ### Migrate
 
-To bulk convert a downloaded library to a different audio format, run
+To bulk convert a downloaded library to a different audio format (multithreaded for significantly faster processing), run
 
 ```bash
-sdm migrate --dir [directory] [target_format]
+sdm migrate --dir [directory] [target_format] -w [workers]
 ```
 
 Example:
 
 ```bash
-sdm migrate --dir "C:\Users\You\Music\FLAC Library" opus
+sdm migrate --dir "C:\Users\You\Music\FLAC Library" opus -w 5
 ```
 
 ## Options & Flags
@@ -179,11 +183,13 @@ sdm migrate --dir "C:\Users\You\Music\FLAC Library" opus
 |---|---|
 | `-o, --output` | Save to a specific directory |
 | `-f, --format` | Audio format: `m4a`, `mp3`, `flac`, `opus` (default: `m4a`) |
-| `-w, --workers` | Number of concurrent downloads (default: `3`) |
+| `-w, --workers` | Number of concurrent downloads or migrations (default: `3`) |
+| `-v, --verbose` | Show detailed list of tracks with warnings during `stats` |
 | `--cleanup` | Run sync cleanup logic on a standard download to remove orphaned files |
 | `--index` | Manually override the track index number when injecting a file |
 | `--dir` | Target directory for the migrate and stats commands |
 | `--lyrics` | Fetch and embed synced lyrics from LRCLIB |
+| `--resize-covers` | Resize high-res cover art to 600x600px to save storage space |
 | `--normalize` | Apply custom 2-pass EBU R128 (-14 LUFS) volume normalization |
 | `--sponsor-block` | Trim non-music sections from YouTube sources |
 | `--dry-run` | Simulate a sync/download without making changes |
@@ -191,6 +197,7 @@ sdm migrate --dir "C:\Users\You\Music\FLAC Library" opus
 | `--refresh-metadata` | Re-tag existing files with the latest metadata (alias: `--refresh`) |
 | `--cookies` | Pass browser cookies for age-restricted content |
 | `--lastfm-key` | Enable extensive track-level genres and wiki summaries via Last.fm API |
+| `--version` | Show the version and exit |
 
 Example with flags:
 

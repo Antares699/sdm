@@ -34,6 +34,27 @@ app = typer.Typer(
 
 console = Console()
 
+__version__ = "2.0.1"
+
+
+def version_callback(value: bool):
+    if value:
+        console.print(f"sdm version {__version__}")
+        raise typer.Exit()
+
+
+@app.callback()
+def sdm_callback(
+    version: typing.Optional[bool] = typer.Option(
+        None,
+        "--version",
+        callback=version_callback,
+        is_eager=True,
+        help="Show the version and exit.",
+    ),
+):
+    pass
+
 
 class AudioFormat(str, Enum):
     m4a = "m4a"
@@ -55,6 +76,7 @@ def execute_sync_or_download(
     normalize: bool,
     lyrics: bool,
     refresh_metadata: bool,
+    resize_covers: bool = False,
 ):
     is_static = False
     if url:
@@ -168,7 +190,9 @@ def execute_sync_or_download(
                 filepath = output_dir / filename
                 if not filepath.exists():
                     return "error", "File not found on disk"
-                if embed_metadata(filepath, track, fetch_lyrics=lyrics):
+                if embed_metadata(
+                    filepath, track, fetch_lyrics=lyrics, resize_covers=resize_covers
+                ):
                     return "success", filename
                 else:
                     return "error", "Failed to refresh metadata"
@@ -185,6 +209,7 @@ def execute_sync_or_download(
                     fetch_lyrics=lyrics,
                     ydl_opts=shared_ydl_opts,
                     refresh_metadata=refresh_metadata,
+                    resize_covers=resize_covers,
                 )
 
         with Progress(
@@ -355,6 +380,7 @@ def execute_sync_or_download(
                             normalize=normalize,
                             fetch_lyrics=lyrics,
                             refresh_metadata=refresh_metadata,
+                            resize_covers=resize_covers,
                         )
                         if f_status in ["fallback_success", "success"]:
                             sync_manager.mark_synced(track["id"], f_message)
@@ -381,7 +407,7 @@ def execute_sync_or_download(
         sync_manager.flush()
 
     if not dry_run and not is_static:
-        m3u_path = output_dir / "_playlist.m3u"
+        m3u_path = output_dir / "_playlist.m3u8"
         try:
             with open(m3u_path, "w", encoding="utf-8") as f:
                 f.write("#EXTM3U\n")
@@ -391,7 +417,9 @@ def execute_sync_or_download(
                     if fname:
                         f.write(fname + "\n")
         except Exception as e:
-            console.print(f"[yellow]Warning:[/] Failed to generate _playlist.m3u ({e})")
+            console.print(
+                f"[yellow]Warning:[/] Failed to generate _playlist.m3u8 ({e})"
+            )
 
     console.print("\n[bold green]Done![/bold green]")
 
@@ -497,6 +525,7 @@ def search(
         normalize=False,
         lyrics=lyrics,
         refresh_metadata=False,
+        resize_covers=False,
     )
 
 
@@ -572,6 +601,12 @@ def download(
         help="Force re-tagging of existing local files",
         rich_help_panel="Metadata & Tags",
     ),
+    resize_covers: bool = typer.Option(
+        False,
+        "--resize-covers",
+        help="Resize high-res cover art to 600x600 to save space",
+        rich_help_panel="Metadata & Tags",
+    ),
 ):
     output_dir = output.resolve()
     kwargs = _merge_config(locals())
@@ -581,6 +616,7 @@ def download(
     sponsor_block = kwargs.get("sponsor_block", sponsor_block)
     normalize = kwargs.get("normalize", normalize)
     lyrics = kwargs.get("lyrics", lyrics)
+    resize_covers = kwargs.get("resize_covers", resize_covers)
 
     execute_sync_or_download(
         url=url,
@@ -595,6 +631,7 @@ def download(
         normalize=normalize,
         lyrics=lyrics,
         refresh_metadata=refresh_metadata,
+        resize_covers=resize_covers,
     )
 
 
@@ -659,6 +696,12 @@ def sync(
         help="Force re-tagging of existing local files",
         rich_help_panel="Metadata & Tags",
     ),
+    resize_covers: bool = typer.Option(
+        False,
+        "--resize-covers",
+        help="Resize high-res cover art to 600x600 to save space",
+        rich_help_panel="Metadata & Tags",
+    ),
 ):
     output_dir = dir.resolve()
     kwargs = _merge_config(locals())
@@ -668,6 +711,7 @@ def sync(
     sponsor_block = kwargs.get("sponsor_block", sponsor_block)
     normalize = kwargs.get("normalize", normalize)
     lyrics = kwargs.get("lyrics", lyrics)
+    resize_covers = kwargs.get("resize_covers", resize_covers)
 
     execute_sync_or_download(
         url=None,
@@ -682,6 +726,7 @@ def sync(
         normalize=normalize,
         lyrics=lyrics,
         refresh_metadata=refresh_metadata,
+        resize_covers=resize_covers,
     )
 
 
@@ -697,7 +742,10 @@ def inject(
         readable=True,
         help="Path to the local audio file to inject",
     ),
-    url: str = typer.Argument(..., help="Track URL to extract metadata and tags from"),
+    url: typing.Optional[str] = typer.Argument(
+        None,
+        help="Track URL to extract metadata and tags from. If omitted, will prompt for search.",
+    ),
     output: Path = typer.Option(
         ".", "--output", "-o", help="Output directory", rich_help_panel="Output Options"
     ),
@@ -726,6 +774,12 @@ def inject(
         help="Automatically fetch and embed synced lyrics",
         rich_help_panel="Metadata & Tags",
     ),
+    resize_covers: bool = typer.Option(
+        False,
+        "--resize-covers",
+        help="Resize high-res cover art to 600x600 to save space",
+        rich_help_panel="Metadata & Tags",
+    ),
 ):
     output_dir = output.resolve()
     sync_manager = SyncManager(output_dir)
@@ -734,7 +788,73 @@ def inject(
         "[bold green]sdm: Fetching metadata for injected track...[/bold green]"
     )
     try:
-        tracks = fetch_tracks(url)
+        url_to_use = url
+        selected = None
+        if not url_to_use:
+            from ytmusicapi import YTMusic
+            from rich.prompt import Prompt, IntPrompt
+
+            query = Prompt.ask(
+                "No URL provided. Enter a track name to search for metadata"
+            )
+            console.print(f"[cyan]Searching for '[bold]{query}[/bold]'...[/cyan]")
+            ytmusic = YTMusic()
+            try:
+                results = ytmusic.search(query, filter="songs", limit=10)
+            except Exception as e:
+                console.print(f"[bold red]Search failed:[/] {e}")
+                raise typer.Exit(1)
+
+            if not results:
+                console.print("[yellow]No results found.[/yellow]")
+                raise typer.Exit()
+
+            results = results[:10]
+
+            table = Table(
+                title="Search Results", show_header=True, header_style="bold magenta"
+            )
+            table.add_column("#", style="dim", justify="right")
+            table.add_column("Title")
+            table.add_column("Artist")
+            table.add_column("Album")
+            table.add_column("Duration", justify="right")
+
+            for i, r in enumerate(results, start=1):
+                t_title = r.get("title", "Unknown")
+                artists_data = r.get("artists", [])
+                t_artists = (
+                    ", ".join([a["name"] for a in artists_data if "name" in a])
+                    if artists_data
+                    else "Unknown"
+                )
+                album_data = r.get("album")
+                t_album = album_data.get("name", "Unknown") if album_data else "Unknown"
+                duration = r.get("duration", "0:00")
+                table.add_row(str(i), t_title, t_artists, t_album, duration)
+
+            console.print(table)
+
+            choice = IntPrompt.ask(
+                "Enter the number of the track to use for metadata (0 to cancel)",
+                choices=[str(i) for i in range(len(results) + 1)],
+                show_choices=False,
+                default=0,
+            )
+
+            if choice == 0:
+                console.print("Cancelled.")
+                raise typer.Exit()
+
+            selected = results[choice - 1]
+            vid = selected.get("videoId")
+            if not vid:
+                console.print("[bold red]Selected track has no video ID.[/bold red]")
+                raise typer.Exit(1)
+
+            url_to_use = f"https://music.youtube.com/watch?v={vid}"
+
+        tracks = fetch_tracks(url_to_use)
         if not tracks:
             console.print("[bold red]Error:[/] No track metadata found for the URL.")
             raise typer.Exit(code=1)
@@ -746,6 +866,54 @@ def inject(
             raise typer.Exit(code=1)
 
         track = tracks[0]
+
+        if not url and selected:
+            clean_title = selected.get("title")
+            if clean_title:
+                track["name"] = clean_title
+
+            artists_data = selected.get("artists", [])
+            clean_artists = [a["name"] for a in artists_data if "name" in a]
+            if clean_artists:
+                track["artists"] = clean_artists
+
+            album_data = selected.get("album")
+            if album_data and "name" in album_data:
+                track["album"] = album_data["name"]
+
+            thumbnails = selected.get("thumbnails", [])
+            if thumbnails:
+                largest_thumb = max(thumbnails, key=lambda x: x.get("width", 0))
+                thumb_url = largest_thumb.get("url", "")
+                if thumb_url:
+                    import re
+
+                    high_res_url = re.sub(
+                        r"([=-])w\d+-h\d+", r"\g<1>w1200-h1200", thumb_url
+                    )
+                    track["cover_url"] = high_res_url
+
+            cfg = load_config()
+            lastfm_key = cfg.get("lastfm_key")
+            if lastfm_key and track.get("artists") and track.get("name"):
+                from sdm.metadata import get_lastfm_metadata
+                import re
+
+                c_artist = track["artists"][0]
+                c_name = re.sub(
+                    r"[\(\[].*?(feat|ft|remaster|radio|edit|mix).*?[\)\]]",
+                    "",
+                    track["name"],
+                    flags=re.I,
+                ).strip()
+                genres, wiki, mbid = get_lastfm_metadata(c_artist, c_name, lastfm_key)
+                if genres:
+                    track["genres"] = genres
+                if wiki:
+                    track["wiki"] = wiki
+                if mbid:
+                    track["mbid"] = mbid
+
         if index:
             index_val = index
         else:
@@ -798,7 +966,9 @@ def inject(
             _apply_twopass_loudnorm(final_filepath, format.value)
 
         console.print("[cyan]Embedding metadata...[/cyan]")
-        if embed_metadata(final_filepath, track, fetch_lyrics=lyrics):
+        if embed_metadata(
+            final_filepath, track, fetch_lyrics=lyrics, resize_covers=resize_covers
+        ):
             sync_manager.mark_injected(track["id"], final_filepath.name)
             console.print(
                 f"[bold green]Successfully injected and synced:[/] {filename_template}"
@@ -850,6 +1020,8 @@ def _merge_config(kwargs):
         kwargs["normalize"] = cfg["normalize"]
     if kwargs.get("lyrics") is False and "lyrics" in cfg:
         kwargs["lyrics"] = cfg["lyrics"]
+    if kwargs.get("resize_covers") is False and "resize_covers" in cfg:
+        kwargs["resize_covers"] = cfg["resize_covers"]
     return kwargs
 
 
@@ -871,6 +1043,9 @@ def config(
         None, "--normalize", help="Apply audio normalization"
     ),
     lyrics: bool = typer.Option(None, "--lyrics", help="Fetch lyrics"),
+    resize_covers: bool = typer.Option(
+        None, "--resize-covers", help="Resize cover art"
+    ),
     lastfm_key: str = typer.Option(
         None, "--lastfm-key", help="Last.fm API Key for extensive metadata"
     ),
@@ -902,6 +1077,9 @@ def config(
         updated = True
     if lyrics is not None:
         cfg["lyrics"] = lyrics
+        updated = True
+    if resize_covers is not None:
+        cfg["resize_covers"] = resize_covers
         updated = True
     if lastfm_key is not None:
         cfg["lastfm_key"] = lastfm_key
@@ -1027,9 +1205,19 @@ def tag(
     )
 
 
+from collections import Counter
+import mutagen
+
+
 @app.command(help="Show statistics for the local library.")
 def stats(
     dir: Path = typer.Argument(".", help="Directory to check"),
+    verbose: bool = typer.Option(
+        False,
+        "--verbose",
+        "-v",
+        help="Show detailed list of tracks with warnings",
+    ),
 ):
     output_dir = dir.resolve()
     sync_manager = SyncManager(output_dir)
@@ -1046,17 +1234,114 @@ def stats(
     total_injected = len(injected_ids)
 
     total_size = 0
-    formats = {}
-    missing = 0
+    formats = Counter()
+    missing_files = 0
 
-    for _, filename in rows:
-        filepath = output_dir / filename
-        if filepath.exists():
+    genres_count = Counter()
+    artists_count = Counter()
+    decades_count = Counter()
+
+    health_missing_cover = []
+    health_low_bitrate = []
+
+    console.print("\n")
+    with Progress(
+        SpinnerColumn(spinner_name="dots" if console.is_terminal else "line"),
+        TextColumn("[bold cyan]Scanning library tags...[/bold cyan]"),
+        BarColumn(),
+        "[progress.percentage]{task.percentage:>3.0f}%",
+        console=console,
+    ) as progress:
+        task = progress.add_task("Scanning...", total=len(rows))
+        for _, filename in rows:
+            filepath = output_dir / filename
+            if not filepath.exists():
+                missing_files += 1
+                progress.advance(task)
+                continue
+
             total_size += filepath.stat().st_size
             ext = filepath.suffix.lower()
-            formats[ext] = formats.get(ext, 0) + 1
-        else:
-            missing += 1
+            formats[ext] += 1
+
+            try:
+                audio = mutagen.File(filepath)
+                if audio is not None:
+                    artist = None
+                    genre = None
+                    year = None
+                    has_cover = False
+
+                    if ext == ".m4a":
+                        artist = (
+                            audio.get("\xa9ART", [""])[0]
+                            if "\xa9ART" in audio
+                            else None
+                        )
+                        genre = (
+                            audio.get("\xa9gen", [""])[0]
+                            if "\xa9gen" in audio
+                            else None
+                        )
+                        year = (
+                            audio.get("\xa9day", [""])[0]
+                            if "\xa9day" in audio
+                            else None
+                        )
+                        has_cover = "covr" in audio
+                    elif ext == ".mp3":
+                        artist = str(audio.get("TPE1", "")) if "TPE1" in audio else None
+                        genre = str(audio.get("TCON", "")) if "TCON" in audio else None
+                        date = audio.get("TDRC", None) or audio.get("TYER", None)
+                        if date:
+                            year = str(date)
+                        has_cover = any(key.startswith("APIC") for key in audio.keys())
+                    elif ext in [".flac", ".opus"]:
+                        artist = (
+                            audio.get("artist", [""])[0] if "artist" in audio else None
+                        )
+                        genre = (
+                            audio.get("genre", [""])[0] if "genre" in audio else None
+                        )
+                        year = audio.get("date", [""])[0] if "date" in audio else None
+                        if ext == ".flac":
+                            has_cover = (
+                                hasattr(audio, "pictures") and len(audio.pictures) > 0
+                            )
+                        else:
+                            has_cover = "metadata_block_picture" in audio
+
+                    if artist:
+                        artists_count[artist] += 1
+                    if genre:
+                        import re
+
+                        for part in re.split(r"[,/]", genre):
+                            p = part.strip()
+                            if p:
+                                genres_count[p] += 1
+                    if year and len(year) >= 4:
+                        try:
+                            dec = int(year[:4]) // 10 * 10
+                            decades_count[f"{dec}s"] += 1
+                        except ValueError:
+                            pass
+
+                    if not has_cover:
+                        health_missing_cover.append(filepath.name)
+
+                    if (
+                        hasattr(audio, "info")
+                        and hasattr(audio.info, "bitrate")
+                        and audio.info.bitrate
+                    ):
+                        if audio.info.bitrate < 128000:
+                            health_low_bitrate.append(filepath.name)
+
+            except Exception:
+                pass
+
+            progress.advance(task)
 
     size_mb = total_size / (1024 * 1024)
 
@@ -1064,8 +1349,9 @@ def stats(
         title=f"Library Statistics: {output_dir.name}",
         show_header=True,
         header_style="bold magenta",
+        expand=True,
     )
-    table.add_column("Metric", style="cyan")
+    table.add_column("Metric", style="cyan", width=20)
     table.add_column("Value", style="green")
 
     table.add_row("Source URL", source_url or "None")
@@ -1076,10 +1362,73 @@ def stats(
     format_str = ", ".join(f"{ext}: {count}" for ext, count in formats.items())
     table.add_row("Formats", format_str or "None")
 
-    if missing > 0:
-        table.add_row("Missing Files", str(missing), style="red")
+    if missing_files > 0:
+        table.add_row("Missing Files", str(missing_files), style="red")
 
     console.print(table)
+    console.print()
+
+    from rich.panel import Panel
+
+    def make_chart_panel(counter, title, color="cyan", limit=5):
+        if not counter:
+            return Panel(
+                "[dim]No data[/dim]",
+                title=f"[bold {color}]{title}[/bold {color}]",
+                border_style=color,
+            )
+
+        max_val = max(counter.values())
+        lines = []
+        for name, count in counter.most_common(limit):
+            bar_len = int((count / max_val) * 40) if max_val > 0 else 0
+            bar = "█" * bar_len
+            lines.append(f"{name[:15]:<15} | [{color}]{bar}[/{color}] {count}")
+        return Panel(
+            "\n".join(lines),
+            title=f"[bold {color}]{title}[/bold {color}]",
+            border_style=color,
+        )
+
+    console.print(make_chart_panel(genres_count, "Top Genres", "magenta"))
+    console.print()
+    console.print(make_chart_panel(artists_count, "Top Artists", "green"))
+    console.print()
+    console.print(make_chart_panel(decades_count, "Decades", "yellow"))
+    console.print()
+
+    health_lines = []
+    if not health_missing_cover and not health_low_bitrate and missing_files == 0:
+        health_lines.append(
+            "[bold green][PASS] Library is in perfect health![/bold green]"
+        )
+    else:
+        if missing_files > 0:
+            health_lines.append(
+                f"[bold red][FAIL] {missing_files} files are missing from disk![/bold red]"
+            )
+        if health_missing_cover:
+            health_lines.append(
+                f"[yellow][WARN] {len(health_missing_cover)} files are missing cover art.[/yellow]"
+            )
+            if verbose:
+                for f in health_missing_cover:
+                    health_lines.append(f"       - {f}")
+        if health_low_bitrate:
+            health_lines.append(
+                f"[yellow][WARN] {len(health_low_bitrate)} files have a bitrate < 128kbps.[/yellow]"
+            )
+            if verbose:
+                for f in health_low_bitrate:
+                    health_lines.append(f"       - {f}")
+
+    console.print(
+        Panel(
+            "\n".join(health_lines),
+            title="[bold red]Library Health[/bold red]",
+            border_style="red",
+        )
+    )
 
 
 @app.command(help="Bulk convert a downloaded library to a different audio format.")
@@ -1087,6 +1436,13 @@ def migrate(
     dir: Path = typer.Option(..., "--dir", help="Target directory"),
     target_format: AudioFormat = typer.Argument(
         ..., help="Target audio format (m4a, mp3, flac, opus)"
+    ),
+    workers: int = typer.Option(
+        3,
+        "--workers",
+        "-w",
+        help="Number of concurrent conversions",
+        rich_help_panel="Performance",
     ),
 ):
     output_dir = dir.resolve()
@@ -1097,13 +1453,60 @@ def migrate(
         console.print("[yellow]No tracked files found in directory.[/yellow]")
         raise typer.Exit()
 
+    from rich.panel import Panel
+
     console.print(
-        f"[bold cyan]Migrating {len(rows)} files to {target_format.value}...[/bold cyan]"
+        Panel(
+            f"[bold cyan]Migrating {len(rows)} files to {target_format.value}...[/bold cyan]",
+            title="⚡ sdm migrate",
+        )
     )
+
     import subprocess
 
     migrated_count = 0
     error_count = 0
+
+    def worker(track_id, filename):
+        filepath = output_dir / filename
+        if (
+            not filepath.exists()
+            or filepath.suffix.lower() == f".{target_format.value}"
+        ):
+            return "skipped", filename
+
+        new_filename = filepath.with_suffix(f".{target_format.value}").name
+        new_filepath = output_dir / new_filename
+
+        cmd = [_get_ffmpeg_path(), "-y", "-i", str(filepath)]
+        codec = {
+            "m4a": "aac",
+            "mp3": "libmp3lame",
+            "flac": "flac",
+            "opus": "libopus",
+        }[target_format.value]
+        cmd.extend(["-c:a", codec])
+
+        if target_format.value == "mp3":
+            cmd.extend(["-q:a", "2"])
+        elif target_format.value == "m4a":
+            cmd.extend(["-b:a", "256k"])
+        elif target_format.value == "opus":
+            cmd.extend(["-b:a", "128k"])
+
+        cmd.extend(["-vn", str(new_filepath)])
+
+        try:
+            subprocess.run(
+                cmd,
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+            return "success", (track_id, new_filename, filepath)
+        except Exception as e:
+            return "error", f"{filename}: {e}"
 
     with Progress(
         SpinnerColumn(),
@@ -1115,63 +1518,42 @@ def migrate(
     ) as progress:
         task = progress.add_task("[bold cyan]Migrating...", total=len(rows))
 
-        for track_id, filename in rows:
-            filepath = output_dir / filename
-            if (
-                not filepath.exists()
-                or filepath.suffix.lower() == f".{target_format.value}"
-            ):
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_to_file = {
+                executor.submit(worker, track_id, filename): filename
+                for track_id, filename in rows
+            }
+            for future in as_completed(future_to_file):
+                status, result = future.result()
+                if status == "success":
+                    track_id, new_filename, old_filepath = result
+                    with sync_manager.conn:
+                        sync_manager.conn.execute(
+                            "UPDATE tracks SET filename = ? WHERE track_id = ?",
+                            (new_filename, track_id),
+                        )
+                    try:
+                        import os
+
+                        os.remove(old_filepath)
+                    except Exception:
+                        pass
+                    migrated_count += 1
+                    progress.console.print(
+                        f"[black on green] SUCCESS [/black on green] Migrated: {new_filename}"
+                    )
+                elif status == "error":
+                    error_count += 1
+                    progress.console.print(
+                        f"[black on red] ERROR [/black on red] Failed to migrate {result}"
+                    )
                 progress.advance(task)
-                continue
-
-            new_filename = filepath.with_suffix(f".{target_format.value}").name
-            new_filepath = output_dir / new_filename
-
-            cmd = [_get_ffmpeg_path(), "-y", "-i", str(filepath)]
-            codec = {
-                "m4a": "aac",
-                "mp3": "libmp3lame",
-                "flac": "flac",
-                "opus": "libopus",
-            }[target_format.value]
-            cmd.extend(["-c:a", codec])
-
-            if target_format.value == "mp3":
-                cmd.extend(["-q:a", "2"])
-            elif target_format.value == "m4a":
-                cmd.extend(["-b:a", "256k"])
-            elif target_format.value == "opus":
-                cmd.extend(["-b:a", "128k"])
-
-            cmd.extend(["-vn", str(new_filepath)])
-
-            try:
-                subprocess.run(
-                    cmd,
-                    check=True,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-
-                sync_manager.conn.execute(
-                    "UPDATE tracks SET filename = ? WHERE track_id = ?",
-                    (new_filename, track_id),
-                )
-                sync_manager.conn.commit()
-
-                filepath.unlink()
-                migrated_count += 1
-                progress.console.print(f"[green][+][/green] Migrated: {new_filename}")
-            except Exception as e:
-                error_count += 1
-                progress.console.print(
-                    f"[red][-][/red] Failed to migrate {filename}: {e}"
-                )
-
-            progress.advance(task)
 
     console.print(
-        f"\n[bold green]Migration complete! Migrated {migrated_count} files.[/bold green] (Errors: {error_count})"
+        Panel(
+            f"[bold green]Migration complete! Migrated {migrated_count} files.[/bold green] (Errors: {error_count})",
+            title="Done",
+        )
     )
 
 

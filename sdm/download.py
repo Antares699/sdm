@@ -475,12 +475,14 @@ def _search_ytmusic(track):
     return best_url
 
 
-def embed_metadata(filepath, track, fetch_lyrics=False):
+def embed_metadata(filepath, track, fetch_lyrics=False, resize_covers=False):
     import time
 
     for attempt in range(5):
         try:
-            success = _embed_metadata_inner(filepath, track, fetch_lyrics)
+            success = _embed_metadata_inner(
+                filepath, track, fetch_lyrics, resize_covers
+            )
             if success:
                 return True
         except PermissionError:
@@ -493,7 +495,7 @@ def embed_metadata(filepath, track, fetch_lyrics=False):
     return False
 
 
-def _embed_metadata_inner(filepath, track, fetch_lyrics=False):
+def _embed_metadata_inner(filepath, track, fetch_lyrics=False, resize_covers=False):
     ext = filepath.suffix.lower()
     name = str(track.get("name", "Unknown"))
     artists = track.get("artists", [])
@@ -518,6 +520,21 @@ def _embed_metadata_inner(filepath, track, fetch_lyrics=False):
         )
 
     cover_data = _get_cached_cover(track.get("cover_url"))
+
+    if cover_data and resize_covers:
+        try:
+            from PIL import Image
+            import io
+
+            img = Image.open(io.BytesIO(cover_data))
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            img.thumbnail((600, 600), Image.Resampling.LANCZOS)
+            out = io.BytesIO()
+            img.save(out, format="JPEG", quality=85)
+            cover_data = out.getvalue()
+        except Exception:
+            pass
 
     try:
         success = False
@@ -746,6 +763,7 @@ def download_and_tag(
     fetch_lyrics=False,
     ydl_opts=None,
     refresh_metadata=False,
+    resize_covers=False,
 ):
     title = sanitize_filename(track.get("name"))
     artists = track.get("artists", [])
@@ -757,7 +775,7 @@ def download_and_tag(
 
     if final_path_obj.exists():
         if refresh_metadata:
-            if not embed_metadata(final_path_obj, track, fetch_lyrics):
+            if not embed_metadata(final_path_obj, track, fetch_lyrics, resize_covers):
                 return "error", "Failed to write metadata (file might be locked)"
         return "success", final_path_obj.name
 
@@ -811,7 +829,9 @@ def download_and_tag(
             if final_path_obj.exists():
                 if normalize:
                     _apply_twopass_loudnorm(final_path_obj, format_flag)
-                if not embed_metadata(final_path_obj, track, fetch_lyrics):
+                if not embed_metadata(
+                    final_path_obj, track, fetch_lyrics, resize_covers
+                ):
                     return "error", "Failed to write metadata (file might be locked)"
                 _download_succeeded = True
                 return "success", final_path_obj.name
@@ -833,6 +853,7 @@ def download_and_tag(
                         yt_logger,
                         fetch_lyrics,
                         normalize,
+                        resize_covers,
                     )
                     if result[0] in ("fallback_success", "success"):
                         _download_succeeded = True
@@ -867,6 +888,7 @@ def download_and_tag(
                             yt_logger,
                             fetch_lyrics,
                             normalize,
+                            resize_covers,
                         )
                         if result[0] in ("fallback_success", "success"):
                             _download_succeeded = True
@@ -883,7 +905,14 @@ def download_and_tag(
 
 
 def _soundcloud_fallback(
-    track, base_filepath, format_flag, ydl, yt_logger, fetch_lyrics, normalize=False
+    track,
+    base_filepath,
+    format_flag,
+    ydl,
+    yt_logger,
+    fetch_lyrics,
+    normalize=False,
+    resize_covers=False,
 ):
     title = track.get("name", "Unknown")
     artists = track.get("artists", [])
@@ -913,7 +942,9 @@ def _soundcloud_fallback(
                 if final_path_obj.exists():
                     if normalize:
                         _apply_twopass_loudnorm(final_path_obj, format_flag)
-                    if not embed_metadata(final_path_obj, track, fetch_lyrics):
+                    if not embed_metadata(
+                        final_path_obj, track, fetch_lyrics, resize_covers
+                    ):
                         return (
                             "error",
                             "Failed to write metadata (file might be locked)",
